@@ -3,9 +3,8 @@ import Link from "next/link";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ClerkProvider } from "@clerk/nextjs";
 import { clerkEnabled } from "@/lib/auth";
-import { AuthButtons } from "@/components/AuthButtons";
+import { SiteNav } from "@/components/SiteNav";
 import { ThemeProvider } from "@/components/theme-provider";
-import { ThemeToggle } from "@/components/theme-toggle";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -42,51 +41,7 @@ function SiteHeader() {
             </span>
           </span>
         </Link>
-        <div className="flex items-center gap-1 text-sm">
-          <Link
-            href="/colleges"
-            className="rounded-md px-3 py-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            Colleges
-          </Link>
-          <Link
-            href="/branches"
-            className="rounded-md px-3 py-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            Branches
-          </Link>
-          <Link
-            href="/spot"
-            className="group relative rounded-md px-3 py-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            SPOT
-            <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-primary" />
-          </Link>
-          <Link
-            href="/compare"
-            className="rounded-md px-3 py-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            Compare
-          </Link>
-          <Link
-            href="/predictor"
-            className="rounded-md px-3 py-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            Predictor
-          </Link>
-          <Link
-            href="/discuss"
-            className="rounded-md px-3 py-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            Discuss
-          </Link>
-          <ThemeToggle />
-          {clerkEnabled && (
-            <div className="ml-1 flex items-center gap-2">
-              <AuthButtons />
-            </div>
-          )}
-        </div>
+        <SiteNav clerkEnabled={clerkEnabled} />
       </nav>
     </header>
   );
