@@ -1,0 +1,9 @@
+# parse_cutoff.py drives Poppler's `pdftotext` (a system binary):
+#   macOS:  brew install poppler
+#   debian: apt-get install poppler-utils
+requests>=2.31        # ingest.py: download official PDFs
+psycopg[binary]>=3.1  # loader (normalize/publish stages): write to Postgres
+
+# Optional: coordinate-precision upgrade for the hardest wrapped-token blocks.
+# Not required for the current pdftotext-based parser.
+# pdfplumber>=0.11
