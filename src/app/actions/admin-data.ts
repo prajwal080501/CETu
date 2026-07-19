@@ -1,9 +1,8 @@
 "use server";
 
 import { requireAdminSession } from "@/lib/admin-auth";
-import { db } from "@/db";
-import { alumni, placements, colleges } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { collections } from "@/db/collections";
+import { nextId, nextIds } from "@/db/ids";
 import { revalidatePath } from "next/cache";
 import { putObject, makeKey, s3Enabled } from "@/lib/s3";
 import { aiEnabled } from "@/lib/ai";
@@ -18,11 +17,9 @@ const MAX_PDF = 25 * 1024 * 1024;
 const MAX_IMG = 8 * 1024 * 1024;
 
 async function collegeSlug(collegeId: number): Promise<string | null> {
-  const [c] = await db
-    .select({ slug: colleges.slug })
-    .from(colleges)
-    .where(eq(colleges.id, collegeId))
-    .limit(1);
+  const c = await collections
+    .colleges()
+    .findOne({ _id: collegeId }, { projection: { slug: 1 } });
   return c?.slug ?? null;
 }
 
@@ -60,18 +57,27 @@ export async function addAlumnusManual(formData: FormData) {
       const ext = photo.type.split("/")[1] || "jpg";
       photoUrl = await putObject(makeKey(`alumni/${collegeId}`, `photo.${ext}`), buf, photo.type);
     }
-    await db.insert(alumni).values({
-      collegeId,
-      name,
-      company,
-      role,
-      batchYear,
-      linkedinUrl,
-      achievement,
-      photoUrl,
-      isVerified: true,
-      verifiedAt: new Date(),
-    });
+    const id = await nextId("alumni");
+    await collections.colleges().updateOne(
+      { _id: collegeId },
+      {
+        $push: {
+          alumni: {
+            id,
+            name,
+            company,
+            role,
+            batchYear,
+            linkedinUrl,
+            achievement,
+            photoUrl,
+            isVerified: true,
+            verifiedAt: new Date(),
+            contributedBy: null,
+          },
+        },
+      }
+    );
     const slug = await collegeSlug(collegeId);
     if (slug) revalidatePath(`/colleges/${slug}`);
     return { ok: true };
@@ -127,21 +133,25 @@ export async function commitAlumni(collegeId: number, records: AlumniRecord[]) {
   await requireAdminSession();
   if (!collegeId || !records?.length) return { ok: false, error: "Nothing to save." };
   const now = new Date();
-  await db.insert(alumni).values(
-    records
-      .filter((r) => r.name?.trim())
-      .map((r) => ({
-        collegeId,
-        name: r.name.trim(),
-        company: r.company?.trim() || null,
-        role: r.role?.trim() || null,
-        batchYear: r.batchYear ?? null,
-        achievement: r.achievement?.trim() || null,
-        linkedinUrl: r.linkedin?.trim() || null,
-        isVerified: true,
-        verifiedAt: now,
-      }))
-  );
+  const clean = records.filter((r) => r.name?.trim());
+  const ids = await nextIds("alumni", clean.length);
+  const docs = clean.map((r, i) => ({
+    id: ids[i],
+    name: r.name.trim(),
+    company: r.company?.trim() || null,
+    role: r.role?.trim() || null,
+    batchYear: r.batchYear ?? null,
+    achievement: r.achievement?.trim() || null,
+    linkedinUrl: r.linkedin?.trim() || null,
+    photoUrl: null,
+    isVerified: true,
+    verifiedAt: now,
+    contributedBy: null,
+  }));
+  if (docs.length)
+    await collections
+      .colleges()
+      .updateOne({ _id: collegeId }, { $push: { alumni: { $each: docs } } });
   const slug = await collegeSlug(collegeId);
   if (slug) revalidatePath(`/colleges/${slug}`);
   return { ok: true, count: records.length };
@@ -151,22 +161,24 @@ export async function commitPlacements(collegeId: number, records: PlacementReco
   await requireAdminSession();
   if (!collegeId || !records?.length) return { ok: false, error: "Nothing to save." };
   const now = new Date();
-  const num = (v: number | null | undefined) => (v == null ? null : String(v));
-  await db.insert(placements).values(
-    records
-      .filter((r) => r.year)
-      .map((r) => ({
-        collegeId,
-        year: r.year,
-        avgPackageLpa: num(r.avgLpa),
-        medianPackageLpa: num(r.medianLpa),
-        highestPackageLpa: num(r.highestLpa),
-        placementRatePct: num(r.ratePct),
-        topRecruiters: r.recruiters?.trim() || null,
-        source: "Admin (Gemini-extracted from official PDF)",
-        verifiedAt: now,
-      }))
-  );
+  const clean = records.filter((r) => r.year);
+  const ids = await nextIds("placements", clean.length);
+  const docs = clean.map((r, i) => ({
+    id: ids[i],
+    year: r.year,
+    avgPackageLpa: r.avgLpa ?? null,
+    medianPackageLpa: r.medianLpa ?? null,
+    highestPackageLpa: r.highestLpa ?? null,
+    placementRatePct: r.ratePct ?? null,
+    topRecruiters: r.recruiters?.trim() || null,
+    source: "Admin (Gemini-extracted from official PDF)",
+    verifiedAt: now,
+    contributedBy: null,
+  }));
+  if (docs.length)
+    await collections
+      .colleges()
+      .updateOne({ _id: collegeId }, { $push: { placements: { $each: docs } } });
   const slug = await collegeSlug(collegeId);
   if (slug) revalidatePath(`/colleges/${slug}`);
   return { ok: true, count: records.length };

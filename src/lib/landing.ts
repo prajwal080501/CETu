@@ -1,18 +1,18 @@
-import { db } from "@/db";
-import { sql } from "drizzle-orm";
-import { unstable_cache } from "next/cache";
+import { cached } from "./query-cache";
+import { collections } from "@/db/collections";
 
 const PREDICT_YEAR = 2025;
 
 /**
- * These landing/reference queries (aggregate counts, competitiveness ranking,
- * the search index) only change when cutoffs/colleges are ingested — never
- * per-request. On serverless + free-tier Postgres, running them live on every
- * request is what made the homepage time out and crash. Wrap each in the data
- * cache so the DB is hit at most once per REVALIDATE window; results are shared
- * across all requests until they expire.
+ * These landing/reference queries only change when cutoffs/colleges are
+ * ingested — never per-request. Wrap each in the data cache so MongoDB is hit at
+ * most once per REVALIDATE window; results are shared across all requests.
  */
 const REVALIDATE = 3600; // 1 hour
+
+function escapeRegex(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 export interface RankedCollege {
   id: number;
@@ -35,59 +35,95 @@ export interface RankedCollege {
  * Colleges ranked by competitiveness = their best Open-category closing
  * percentile in the latest year (higher = harder to get = "top"). Colleges with
  * no cutoff sort last. Powers the list page and the landing "top colleges".
+ *
+ * Single-pass: one aggregation over cutoffs (best GOPEN %ile + its branch per
+ * college) and one over offerings (seats + branch count), joined onto colleges
+ * in JS (~389 rows). Denormalized fields on cutoffs/offerings avoid $lookup.
  */
-export const getRankedColleges = unstable_cache(
+export const getRankedColleges = cached(
   async (opts?: {
     area?: string;
     limit?: number;
   }): Promise<RankedCollege[]> => {
-  const areaClause = opts?.area
-    ? sql`and c.city ilike ${opts.area}`
-    : sql``;
-  const limitClause = opts?.limit ? sql`limit ${opts.limit}` : sql``;
-  // Single-pass ranking: compute each college's seats/branch-count and its best
-  // GOPEN closing percentile (+ the branch that owns it) in two grouped scans,
-  // then join onto colleges. This replaces four correlated subqueries per row
-  // (which forced the 65k-row cutoffs table to be re-scanned per college) with
-  // one aggregate over each source table.
-  const rows = await db.execute(sql`
-    with seat_agg as (
-      select cb.college_id,
-             coalesce(sum(cb.total_intake), 0)::int as total_seats,
-             count(*)::int as branch_count
-      from college_branches cb
-      group by cb.college_id
-    ),
-    cut_agg as (
-      select cb.college_id,
-             max(cu.closing_percentile)::float as top_cutoff,
-             (array_agg(b.name order by cu.closing_percentile desc))[1] as top_branch
-      from college_branches cb
-      join cutoffs cu on cu.college_branch_id = cb.id
-      join categories cat on cat.id = cu.category_id
-      join branches b on b.id = cb.branch_id
-      where cu.year = ${PREDICT_YEAR}
-        and cat.code = 'GOPEN'
-        and cu.verified_at is not null
-      group by cb.college_id
-    )
-    select
-      c.id, c.name, c.slug, c.city, c.type, c.is_autonomous as "isAutonomous",
-      c.aicte_approved as "aicteApproved", c.naac_grade as "naacGrade",
-      c.website, u.name as university,
-      coalesce(sa.total_seats, 0) as "totalSeats",
-      coalesce(sa.branch_count, 0) as "branchCount",
-      ca.top_cutoff as "topCutoff",
-      ca.top_branch as "topBranch"
-    from colleges c
-    left join universities u on u.id = c.home_university_id
-    left join seat_agg sa on sa.college_id = c.id
-    left join cut_agg ca on ca.college_id = c.id
-    where c.hidden = false ${areaClause}
-    order by "topCutoff" desc nulls last, "totalSeats" desc
-    ${limitClause}
-  `);
-  return rows as unknown as RankedCollege[];
+    const [seatAgg, cutAgg, branches] = await Promise.all([
+      collections
+        .offerings()
+        .aggregate<{ _id: number; totalSeats: number; branchCount: number }>([
+          {
+            $group: {
+              _id: "$collegeId",
+              totalSeats: { $sum: { $ifNull: ["$totalIntake", 0] } },
+              branchCount: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray(),
+      collections
+        .cutoffs()
+        .aggregate<{ _id: number; topCutoff: number; topBranchId: number }>([
+          {
+            $match: {
+              year: PREDICT_YEAR,
+              categoryCode: "GOPEN",
+              verifiedAt: { $ne: null },
+            },
+          },
+          { $sort: { closingPercentile: -1, branchId: 1 } },
+          {
+            $group: {
+              _id: "$collegeId",
+              topCutoff: { $max: "$closingPercentile" },
+              topBranchId: { $first: "$branchId" }, // sorted → first = max (branchId breaks ties)
+            },
+          },
+        ])
+        .toArray(),
+      collections.branches().find({}, { projection: { name: 1 } }).toArray(),
+    ]);
+
+    const seatById = new Map(seatAgg.map((s) => [s._id, s]));
+    const cutById = new Map(cutAgg.map((c) => [c._id, c]));
+    const branchName = new Map(branches.map((b) => [b._id, b.name]));
+
+    const filter: Record<string, unknown> = { hidden: false };
+    if (opts?.area) {
+      filter.city = { $regex: `^${escapeRegex(opts.area)}$`, $options: "i" };
+    }
+    const cols = await collections.colleges().find(filter).toArray();
+
+    const rows: RankedCollege[] = cols.map((c) => {
+      const seat = seatById.get(c._id);
+      const cut = cutById.get(c._id);
+      return {
+        id: c._id,
+        name: c.name,
+        slug: c.slug,
+        city: c.city,
+        university: c.homeUniversityName,
+        type: c.type,
+        isAutonomous: c.isAutonomous,
+        aicteApproved: c.aicteApproved,
+        naacGrade: c.naacGrade,
+        website: c.website,
+        totalSeats: seat?.totalSeats ?? 0,
+        branchCount: seat?.branchCount ?? 0,
+        topCutoff: cut?.topCutoff ?? null,
+        topBranch: cut ? branchName.get(cut.topBranchId) ?? null : null,
+      };
+    });
+
+    // order by topCutoff desc nulls last, then totalSeats desc, then id (stable)
+    rows.sort((a, b) => {
+      if (a.topCutoff != null || b.topCutoff != null) {
+        if (a.topCutoff == null) return 1;
+        if (b.topCutoff == null) return -1;
+        if (b.topCutoff !== a.topCutoff) return b.topCutoff - a.topCutoff;
+      }
+      if (b.totalSeats !== a.totalSeats) return b.totalSeats - a.totalSeats;
+      return a.id - b.id;
+    });
+
+    return opts?.limit ? rows.slice(0, opts.limit) : rows;
   },
   ["ranked-colleges"],
   { revalidate: REVALIDATE },
@@ -105,120 +141,198 @@ export interface SearchDoc {
  * ordered by competitiveness so equal-relevance ties surface the top college
  * first. Small enough (~389 rows) to filter instantly in the browser.
  */
-export const getSearchIndex = unstable_cache(
+export const getSearchIndex = cached(
   async (): Promise<SearchDoc[]> => {
-  const rows = await db.execute(sql`
-    with cut_agg as (
-      select cb.college_id, max(cu.closing_percentile) as top_cutoff
-      from college_branches cb
-      join cutoffs cu on cu.college_branch_id = cb.id
-      join categories cat on cat.id = cu.category_id
-      where cu.year = ${PREDICT_YEAR}
-        and cat.code = 'GOPEN' and cu.verified_at is not null
-      group by cb.college_id
-    )
-    select c.name, c.slug, c.city, u.name as university
-    from colleges c
-    left join universities u on u.id = c.home_university_id
-    left join cut_agg ca on ca.college_id = c.id
-    where c.hidden = false
-    order by ca.top_cutoff desc nulls last, c.name
-  `);
-  return rows as unknown as SearchDoc[];
+    const [cutAgg, cols] = await Promise.all([
+      collections
+        .cutoffs()
+        .aggregate<{ _id: number; topCutoff: number }>([
+          {
+            $match: {
+              year: PREDICT_YEAR,
+              categoryCode: "GOPEN",
+              verifiedAt: { $ne: null },
+            },
+          },
+          { $group: { _id: "$collegeId", topCutoff: { $max: "$closingPercentile" } } },
+        ])
+        .toArray(),
+      collections
+        .colleges()
+        .find(
+          { hidden: false },
+          { projection: { name: 1, slug: 1, city: 1, homeUniversityName: 1 } }
+        )
+        .toArray(),
+    ]);
+
+    const cutById = new Map(cutAgg.map((c) => [c._id, c.topCutoff]));
+
+    return cols
+      .map((c) => ({
+        name: c.name,
+        slug: c.slug,
+        city: c.city,
+        university: c.homeUniversityName,
+        _top: cutById.get(c._id) ?? null,
+      }))
+      .sort((a, b) => {
+        if (a._top == null && b._top == null) return a.name.localeCompare(b.name);
+        if (a._top == null) return 1;
+        if (b._top == null) return -1;
+        if (b._top !== a._top) return b._top - a._top;
+        return a.name.localeCompare(b.name);
+      })
+      .map(({ name, slug, city, university }) => ({ name, slug, city, university }));
   },
   ["search-index"],
   { revalidate: REVALIDATE },
 );
 
 /** Headline totals for the landing hero. */
-export const getLandingStats = unstable_cache(
+export const getLandingStats = cached(
   async () => {
-    const rows = await db.execute(sql`
-      select
-        (select count(*) from colleges where not hidden)::int as colleges,
-        (select count(*) from branches)::int as branches,
-        (select coalesce(sum(total_intake),0) from college_branches)::int as seats,
-        (select count(*) from cutoffs)::int as cutoffs,
-        (select count(distinct year) from cutoffs)::int as years
-    `);
-    return (rows as unknown as {
-      colleges: number;
-      branches: number;
-      seats: number;
-      cutoffs: number;
-      years: number;
-    }[])[0];
+    const [colleges, branches, cutoffs, years, seatAgg] = await Promise.all([
+      collections.colleges().countDocuments({ hidden: false }),
+      collections.branches().countDocuments(),
+      collections.cutoffs().countDocuments(),
+      collections.cutoffs().distinct("year"),
+      collections
+        .offerings()
+        .aggregate<{ seats: number }>([
+          { $group: { _id: null, seats: { $sum: { $ifNull: ["$totalIntake", 0] } } } },
+        ])
+        .toArray(),
+    ]);
+    return {
+      colleges,
+      branches,
+      seats: seatAgg[0]?.seats ?? 0,
+      cutoffs,
+      years: years.length,
+    };
   },
   ["landing-stats"],
   { revalidate: REVALIDATE },
 );
 
 /** Seats grouped by branch family (for a bar chart). */
-export const getSeatsByFamily = unstable_cache(
+export const getSeatsByFamily = cached(
   async () => {
-    const rows = await db.execute(sql`
-      select coalesce(b.family, 'Other') as family,
-             coalesce(sum(cb.total_intake), 0)::int as seats
-      from college_branches cb join branches b on b.id = cb.branch_id
-      group by b.family order by seats desc
-    `);
-    return rows as unknown as { family: string; seats: number }[];
+    const rows = await collections
+      .offerings()
+      .aggregate<{ family: string; seats: number }>([
+        {
+          $group: {
+            _id: { $ifNull: ["$family", "Other"] },
+            seats: { $sum: { $ifNull: ["$totalIntake", 0] } },
+          },
+        },
+        { $project: { _id: 0, family: "$_id", seats: 1 } },
+        { $sort: { seats: -1 } },
+      ])
+      .toArray();
+    return rows;
   },
   ["seats-by-family"],
   { revalidate: REVALIDATE },
 );
 
-/** Colleges + seats grouped by home university region (for a bar chart). */
-export const getCollegesByRegion = unstable_cache(
+/** Colleges grouped by home university region (for a bar chart). */
+export const getCollegesByRegion = cached(
   async () => {
-    const rows = await db.execute(sql`
-      select coalesce(u.short_name, u.name, 'Unmapped') as region,
-             count(distinct c.id)::int as colleges
-      from colleges c left join universities u on u.id = c.home_university_id
-      group by u.short_name, u.name order by colleges desc limit 10
-    `);
-    return rows as unknown as { region: string; colleges: number }[];
+    const [cols, univs] = await Promise.all([
+      collections
+        .colleges()
+        .find({}, { projection: { homeUniversityId: 1 } })
+        .toArray(),
+      collections.universities().find({}).toArray(),
+    ]);
+    const univById = new Map(univs.map((u) => [u._id, u]));
+    const counts = new Map<string, number>();
+    for (const c of cols) {
+      const u = c.homeUniversityId ? univById.get(c.homeUniversityId) : null;
+      const region = u?.shortName || u?.name || "Unmapped";
+      counts.set(region, (counts.get(region) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([region, colleges]) => ({ region, colleges }))
+      .sort((a, b) => b.colleges - a.colleges)
+      .slice(0, 10);
   },
   ["colleges-by-region"],
   { revalidate: REVALIDATE },
 );
 
 /** Colleges with the highest verified placement packages (for a home widget). */
-export const getTopPlacements = unstable_cache(
+export const getTopPlacements = cached(
   async (limit = 6) => {
-  const rows = await db.execute(sql`
-    select c.name, c.slug, c.city,
-           max(p.highest_package_lpa)::float as highest,
-           max(p.median_package_lpa)::float as median,
-           max(p.avg_package_lpa)::float as avg
-    from placements p join colleges c on c.id = p.college_id
-    where p.verified_at is not null and p.highest_package_lpa is not null and not c.hidden
-    group by c.id, c.name, c.slug, c.city
-    order by max(p.highest_package_lpa) desc
-    limit ${limit}
-  `);
-  return rows as unknown as {
-    name: string;
-    slug: string;
-    city: string | null;
-    highest: number | null;
-    median: number | null;
-    avg: number | null;
-  }[];
+    const rows = await collections
+      .colleges()
+      .aggregate<{
+        name: string;
+        slug: string;
+        city: string | null;
+        highest: number | null;
+        median: number | null;
+        avg: number | null;
+      }>([
+        { $match: { hidden: false } },
+        {
+          $project: {
+            name: 1,
+            slug: 1,
+            city: 1,
+            vp: {
+              $filter: {
+                input: "$placements",
+                as: "p",
+                cond: {
+                  $and: [
+                    { $ne: ["$$p.verifiedAt", null] },
+                    { $ne: ["$$p.highestPackageLpa", null] },
+                  ],
+                },
+              },
+            },
+          },
+        },
+        { $match: { "vp.0": { $exists: true } } },
+        {
+          $project: {
+            _id: 0,
+            name: 1,
+            slug: 1,
+            city: 1,
+            highest: { $max: "$vp.highestPackageLpa" },
+            median: { $max: "$vp.medianPackageLpa" },
+            avg: { $max: "$vp.avgPackageLpa" },
+          },
+        },
+        { $sort: { highest: -1 } },
+        { $limit: limit },
+      ])
+      .toArray();
+    return rows;
   },
   ["top-placements"],
   { revalidate: REVALIDATE },
 );
 
 /** Top areas (cities) by number of colleges — for the area browser. */
-export const getAreaFacets = unstable_cache(
+export const getAreaFacets = cached(
   async (limit = 12) => {
-    const rows = await db.execute(sql`
-      select city, count(*)::int as colleges
-      from colleges where city is not null and not hidden
-      group by city order by colleges desc limit ${limit}
-    `);
-    return rows as unknown as { city: string; colleges: number }[];
+    const rows = await collections
+      .colleges()
+      .aggregate<{ city: string; colleges: number }>([
+        { $match: { hidden: false, city: { $ne: null } } },
+        { $group: { _id: "$city", colleges: { $sum: 1 } } },
+        { $project: { _id: 0, city: "$_id", colleges: 1 } },
+        { $sort: { colleges: -1 } },
+        { $limit: limit },
+      ])
+      .toArray();
+    return rows;
   },
   ["area-facets"],
   { revalidate: REVALIDATE },

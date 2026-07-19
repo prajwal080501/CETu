@@ -1,28 +1,23 @@
 /**
  * Load parsed CAP cutoff rows (JSONL from pipeline/parse_cutoff.py) into
- * Postgres. Upserts universities, colleges, branches, categories and
- * college-branch offerings, then inserts cutoffs.
+ * MongoDB. Upserts universities, colleges, branches, categories and
+ * college-branch offerings, then inserts cutoffs (denormalized).
  *
  * Faithful-first: every distinct branch string and base category from the PDF
  * becomes its own row (lossless).
  *
  * Two entry points:
- *  - CLI: `DATABASE_URL=... tsx src/db/load-cutoffs.ts rows.jsonl` (verifies rows).
+ *  - CLI: `MONGODB_URI=... tsx src/db/load-cutoffs.ts rows.jsonl` (verifies rows).
  *  - `loadCutoffRows(rows, opts)`: importable by the admin upload flow, which
  *    loads rows as PENDING (`verifiedAt: null`) linked to a sourceDocument.
  */
 import { readFileSync, existsSync } from "node:fs";
-import { db } from "./index";
-import {
-  categories,
-  universities,
-  branches,
-  colleges,
-  collegeBranches,
-  cutoffs,
-} from "./schema";
-import { sql } from "drizzle-orm";
+import { mongoClient } from "./mongo";
+import { collections } from "./collections";
+import { nextIds } from "./ids";
 import { inferUniversity, extractCity, branchFamily } from "@/lib/normalize";
+import type { AnyBulkWriteOperation } from "mongodb";
+import type { CutoffDoc } from "./collections";
 
 export interface ParsedRow {
   year: number;
@@ -41,13 +36,13 @@ export interface ParsedRow {
 }
 
 type SeatType = "HU" | "HU_OHU" | "OHU" | "SL" | "AI" | "MI" | "INST";
+type CollegeType =
+  | "government" | "autonomous" | "government_aided"
+  | "private_unaided" | "university_dept" | null;
 
 // "Autonomous Institute" / "Deemed to be University" are not real universities;
 // such colleges have no HU/OHU competition, so we leave home_university null.
-const NON_UNIVERSITY = new Set([
-  "Autonomous Institute",
-  "Deemed to be University",
-]);
+const NON_UNIVERSITY = new Set(["Autonomous Institute", "Deemed to be University"]);
 
 const COLLEGE_TYPE: Record<string, string> = {
   Government: "government",
@@ -67,7 +62,6 @@ function slugify(s: string): string {
     .slice(0, 150);
 }
 
-// Coarse UI group from a base category code.
 function categoryGroup(code: string): string {
   if (code === "EWS") return "ews";
   if (code === "TFWS") return "tfws";
@@ -97,18 +91,10 @@ export interface LoadSummary {
   cutoffs: number;
 }
 
-/**
- * Upsert reference data + offerings and insert cutoffs for `rows`.
- * `opts.verifiedAt` — pass `new Date()` for the trusted CLI pipeline, or `null`
- * to stage rows for admin approval. `opts.sourceDocumentId` links the cutoffs to
- * their provenance record (used to approve/reject a batch).
- */
 export async function loadCutoffRows(
   rows: ParsedRow[],
   opts: { verifiedAt: Date | null; sourceDocumentId?: number }
 ): Promise<LoadSummary> {
-  // Authoritative institute -> home-university crosswalk. Optional; falls back
-  // to the per-row value. Path via CET_UNIV_XWALK.
   const xwalkPath = process.env.CET_UNIV_XWALK;
   const crosswalk: Record<string, string> =
     xwalkPath && existsSync(xwalkPath)
@@ -123,107 +109,175 @@ export async function loadCutoffRows(
     return inferUniversity(r.institute_name) ?? "";
   };
 
-  // --- universities -------------------------------------------------------
+  // --- universities (upsert by name, generate int ids) --------------------
   const uniNames = [...new Set(rows.map(homeUnivOf).filter((u) => u.length > 0))];
-  if (uniNames.length)
-    await db
-      .insert(universities)
-      .values(uniNames.map((name) => ({ name })))
-      .onConflictDoNothing();
-  const uniRows = await db.select().from(universities);
-  const uniByName = new Map(uniRows.map((u) => [u.name, u.id]));
+  const uniByName = new Map<string, number>();
+  const uniNameById = new Map<number, string>();
+  {
+    const existing = await collections.universities().find({ name: { $in: uniNames } }).toArray();
+    for (const u of existing) { uniByName.set(u.name, u._id); uniNameById.set(u._id, u.name); }
+    const missing = uniNames.filter((n) => !uniByName.has(n));
+    if (missing.length) {
+      const ids = await nextIds("universities", missing.length);
+      await collections.universities().insertMany(
+        missing.map((name, i) => ({ _id: ids[i], name, shortName: null }))
+      );
+      missing.forEach((name, i) => { uniByName.set(name, ids[i]); uniNameById.set(ids[i], name); });
+    }
+  }
 
-  // --- categories ---------------------------------------------------------
+  // --- categories (upsert by code) ----------------------------------------
   const catCodes = [...new Set(rows.map((r) => r.base_category))];
-  if (catCodes.length)
-    await db
-      .insert(categories)
-      .values(
-        catCodes.map((code) => ({
-          code,
-          label: categoryLabel(code),
-          group: categoryGroup(code),
+  const catByCode = new Map<string, number>();
+  {
+    const existing = await collections.categories().find({ code: { $in: catCodes } }).toArray();
+    for (const c of existing) catByCode.set(c.code, c._id);
+    const missing = catCodes.filter((c) => !catByCode.has(c));
+    if (missing.length) {
+      const ids = await nextIds("categories", missing.length);
+      await collections.categories().insertMany(
+        missing.map((code, i) => ({
+          _id: ids[i], code, label: categoryLabel(code), group: categoryGroup(code),
         }))
-      )
-      .onConflictDoNothing();
-  const catRows = await db.select().from(categories);
-  const catByCode = new Map(catRows.map((c) => [c.code, c.id]));
+      );
+      missing.forEach((code, i) => catByCode.set(code, ids[i]));
+    }
+  }
 
-  // --- branches -----------------------------------------------------------
+  // --- branches (upsert by name, dedup slug) ------------------------------
   const branchNames = [...new Set(rows.map((r) => r.branch))];
-  const seen = new Map<string, number>();
-  const branchValues = branchNames.map((name) => {
-    let slug = slugify(name);
-    const n = seen.get(slug) ?? 0;
-    seen.set(slug, n + 1);
-    if (n > 0) slug = `${slug}-${n}`;
-    return { name, slug, family: branchFamily(name) };
-  });
-  if (branchValues.length)
-    await db.insert(branches).values(branchValues).onConflictDoNothing();
-  const branchRows = await db.select().from(branches);
-  const branchByName = new Map(branchRows.map((b) => [b.name, b.id]));
+  const branchByName = new Map<string, number>();
+  const familyByName = new Map<string, string | null>();
+  for (const name of branchNames) familyByName.set(name, branchFamily(name));
+  {
+    const existing = await collections.branches().find({ name: { $in: branchNames } }).toArray();
+    for (const b of existing) branchByName.set(b.name, b._id);
+    const missing = branchNames.filter((n) => !branchByName.has(n));
+    if (missing.length) {
+      // Ensure globally-unique slugs (check existing slugs too).
+      const used = new Set((await collections.branches().find({}, { projection: { slug: 1 } }).toArray()).map((b) => b.slug));
+      const ids = await nextIds("branches", missing.length);
+      const docs = missing.map((name, i) => {
+        let slug = slugify(name);
+        let n = 1;
+        while (used.has(slug)) slug = `${slugify(name)}-${n++}`;
+        used.add(slug);
+        return { _id: ids[i], name, slug, degree: "BE", family: branchFamily(name) };
+      });
+      await collections.branches().insertMany(docs);
+      missing.forEach((name, i) => branchByName.set(name, ids[i]));
+    }
+  }
 
-  // --- colleges -----------------------------------------------------------
+  // --- colleges (upsert by dteCode, merge; preserve embedded arrays) ------
   const byCode = new Map<string, ParsedRow>();
   for (const r of rows) if (!byCode.has(r.institute_code)) byCode.set(r.institute_code, r);
-  const collegeValues = [...byCode.values()].map((r) => {
-    const uName = homeUnivOf(r);
-    const homeUniversityId = uName ? uniByName.get(uName) ?? null : null;
-    return {
-      dteCode: r.institute_code,
-      name: r.institute_name,
-      slug: `${slugify(r.institute_name)}-${r.institute_code}`,
-      city: extractCity(r.institute_name),
-      homeUniversityId,
-      type: (COLLEGE_TYPE[r.college_status] ?? null) as
-        | "government"
-        | "autonomous"
-        | "government_aided"
-        | "private_unaided"
-        | "university_dept"
-        | null,
-      isAutonomous: /autonomous/i.test(r.college_status),
-    };
-  });
-  if (collegeValues.length)
-    await db
-      .insert(colleges)
-      .values(collegeValues)
-      .onConflictDoUpdate({
-        target: colleges.dteCode,
-        set: {
-          name: sql`excluded.name`,
-          city: sql`coalesce(excluded.city, ${colleges.city})`,
-          homeUniversityId: sql`coalesce(excluded.home_university_id, ${colleges.homeUniversityId})`,
-          type: sql`coalesce(excluded.type, ${colleges.type})`,
-          isAutonomous: sql`${colleges.isAutonomous} or excluded.is_autonomous`,
-        },
-      });
-  const collegeRows = await db.select().from(colleges);
-  const collegeByCode = new Map(collegeRows.map((c) => [c.dteCode, c.id]));
+  const collegeByCode = new Map<string, number>();
+  const collegeCity = new Map<number, string | null>();
+  const collegeHuId = new Map<number, number | null>();
+  const collegeName = new Map<number, string>();
+  {
+    const codes = [...byCode.keys()];
+    const existing = await collections.colleges().find({ dteCode: { $in: codes } }).toArray();
+    const existByCode = new Map(existing.map((c) => [c.dteCode, c]));
+    const newCodes = codes.filter((c) => !existByCode.has(c));
+    const newIds = await nextIds("colleges", newCodes.length);
+    const newIdByCode = new Map(newCodes.map((c, i) => [c, newIds[i]]));
 
-  // --- college_branches (offerings) --------------------------------------
+    for (const [code, r] of byCode) {
+      const uName = homeUnivOf(r);
+      const huId = uName ? uniByName.get(uName) ?? null : null;
+      const city = extractCity(r.institute_name);
+      const type = (COLLEGE_TYPE[r.college_status] ?? null) as CollegeType;
+      const isAuto = /autonomous/i.test(r.college_status);
+      const existingC = existByCode.get(code);
+      if (existingC) {
+        const mergedHuId = huId ?? existingC.homeUniversityId ?? null;
+        const mergedCity = city ?? existingC.city ?? null;
+        await collections.colleges().updateOne(
+          { _id: existingC._id },
+          {
+            $set: {
+              name: r.institute_name,
+              city: mergedCity,
+              homeUniversityId: mergedHuId,
+              homeUniversityName: mergedHuId ? uniNameById.get(mergedHuId) ?? existingC.homeUniversityName : existingC.homeUniversityName,
+              type: type ?? existingC.type ?? null,
+              isAutonomous: existingC.isAutonomous || isAuto,
+            },
+          }
+        );
+        collegeByCode.set(code, existingC._id);
+        collegeCity.set(existingC._id, mergedCity);
+        collegeHuId.set(existingC._id, mergedHuId);
+        collegeName.set(existingC._id, r.institute_name);
+      } else {
+        const id = newIdByCode.get(code)!;
+        await collections.colleges().insertOne({
+          _id: id,
+          dteCode: code,
+          name: r.institute_name,
+          slug: `${slugify(r.institute_name)}-${code}`,
+          city,
+          district: null,
+          homeUniversityId: huId,
+          homeUniversityName: huId ? uniNameById.get(huId) ?? null : null,
+          type,
+          isAutonomous: isAuto,
+          aicteApproved: true,
+          naacGrade: null, naacCgpa: null, naacValidUpto: null, naacSource: null,
+          nirfInstituteId: null, campusAcres: null, establishedYear: null,
+          website: null, avgFeeAnnual: null, hidden: false, createdAt: new Date(),
+          placements: [], nirfRankings: [], fees: [], alumni: [], documents: [],
+        });
+        collegeByCode.set(code, id);
+        collegeCity.set(id, city);
+        collegeHuId.set(id, huId);
+        collegeName.set(id, r.institute_name);
+      }
+    }
+  }
+
+  // --- offerings (upsert by collegeId+branchId) ---------------------------
   const offerings = new Map<string, { collegeId: number; branchId: number }>();
   for (const r of rows) {
-    const key = `${r.institute_code}|${r.branch}`;
-    if (offerings.has(key)) continue;
     const collegeId = collegeByCode.get(r.institute_code);
     const branchId = branchByName.get(r.branch);
-    if (collegeId && branchId) offerings.set(key, { collegeId, branchId });
+    if (!collegeId || !branchId) continue;
+    const key = `${collegeId}|${branchId}`;
+    if (!offerings.has(key)) offerings.set(key, { collegeId, branchId });
   }
-  if (offerings.size)
-    await db
-      .insert(collegeBranches)
-      .values([...offerings.values()].map((o) => ({ collegeId: o.collegeId, branchId: o.branchId })))
-      .onConflictDoNothing();
-  const cbRows = await db
-    .select({ id: collegeBranches.id, collegeId: collegeBranches.collegeId, branchId: collegeBranches.branchId })
-    .from(collegeBranches);
-  const cbByKey = new Map(cbRows.map((c) => [`${c.collegeId}|${c.branchId}`, c.id]));
+  const cbByKey = new Map<string, number>();
+  {
+    const keys = [...offerings.values()];
+    const existing = await collections.offerings().find({
+      $or: keys.map((o) => ({ collegeId: o.collegeId, branchId: o.branchId })),
+    }).toArray();
+    for (const o of existing) cbByKey.set(`${o.collegeId}|${o.branchId}`, o._id);
+    const missing = keys.filter((o) => !cbByKey.has(`${o.collegeId}|${o.branchId}`));
+    if (missing.length) {
+      const ids = await nextIds("offerings", missing.length);
+      await collections.offerings().insertMany(
+        missing.map((o, i) => ({
+          _id: ids[i],
+          collegeId: o.collegeId,
+          collegeName: collegeName.get(o.collegeId) ?? "",
+          city: collegeCity.get(o.collegeId) ?? null,
+          branchId: o.branchId,
+          branchName: branchNames.find((n) => branchByName.get(n) === o.branchId) ?? "",
+          family: [...familyByName.entries()].find(([n]) => branchByName.get(n) === o.branchId)?.[1] ?? null,
+          totalIntake: null, capSeats: null, msSeats: null, minoritySeats: null,
+          aiSeats: null, isNbaAccredited: false,
+        }))
+      );
+      missing.forEach((o, i) => cbByKey.set(`${o.collegeId}|${o.branchId}`, ids[i]));
+    }
+  }
 
-  // --- cutoffs ------------------------------------------------------------
-  const cutoffValues = [];
+  // --- cutoffs (denormalized, dedup on unique key via upsert) -------------
+  const ops: AnyBulkWriteOperation<CutoffDoc>[] = [];
+  const branchFamById = new Map<number, string | null>();
+  for (const [name, id] of branchByName) branchFamById.set(id, familyByName.get(name) ?? null);
   for (const r of rows) {
     const collegeId = collegeByCode.get(r.institute_code);
     const branchId = branchByName.get(r.branch);
@@ -231,64 +285,72 @@ export async function loadCutoffRows(
     if (!collegeId || !branchId || !categoryId) continue;
     const cbId = cbByKey.get(`${collegeId}|${branchId}`);
     if (!cbId) continue;
-    cutoffValues.push({
+    const doc: Omit<CutoffDoc, "_id"> = {
       collegeBranchId: cbId,
+      collegeId,
+      collegeHomeUniversityId: collegeHuId.get(collegeId) ?? null,
+      branchId,
+      family: branchFamById.get(branchId) ?? null,
+      city: collegeCity.get(collegeId) ?? null,
       year: r.year,
       round: r.round,
       seatType: r.seat_section as SeatType,
       categoryId,
+      categoryCode: r.base_category,
+      categoryGroup: categoryGroup(r.base_category),
       choiceCode: r.choice_code,
-      closingPercentile: String(r.percentile),
+      closingPercentile: Number(r.percentile),
       closingMeritNo: r.merit_no,
       sourceDocumentId: opts.sourceDocumentId ?? null,
       verifiedAt: opts.verifiedAt,
+      createdAt: new Date(),
+    };
+    ops.push({
+      updateOne: {
+        filter: {
+          collegeBranchId: cbId, year: r.year, round: r.round,
+          seatType: doc.seatType, categoryId,
+        },
+        update: { $setOnInsert: doc },
+        upsert: true,
+      },
     });
   }
   const CHUNK = 1000;
-  for (let i = 0; i < cutoffValues.length; i += CHUNK) {
-    await db
-      .insert(cutoffs)
-      .values(cutoffValues.slice(i, i + CHUNK))
-      .onConflictDoNothing();
+  for (let i = 0; i < ops.length; i += CHUNK) {
+    await collections.cutoffs().bulkWrite(ops.slice(i, i + CHUNK), { ordered: false });
   }
 
   return {
     universities: uniNames.length,
     categories: catCodes.length,
     branches: branchNames.length,
-    colleges: collegeValues.length,
+    colleges: byCode.size,
     offerings: offerings.size,
-    cutoffs: cutoffValues.length,
+    cutoffs: ops.length,
   };
 }
 
 async function main() {
   const path = process.argv[2];
   if (!path) throw new Error("usage: tsx src/db/load-cutoffs.ts rows.jsonl");
+  await mongoClient.connect();
 
   const rows: ParsedRow[] = readFileSync(path, "utf8")
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => JSON.parse(l));
+    .split("\n").filter(Boolean).map((l) => JSON.parse(l));
   console.log(`read ${rows.length} parsed rows`);
 
   const s = await loadCutoffRows(rows, { verifiedAt: new Date() });
-
-  const [{ n } = { n: 0 }] = await db
-    .select({ n: sql<number>`count(*)::int` })
-    .from(cutoffs);
+  const n = await collections.cutoffs().countDocuments();
   console.log(
     `loaded: ${s.universities} universities, ${s.categories} categories, ` +
       `${s.branches} branches, ${s.colleges} colleges, ${s.offerings} offerings, ` +
       `${s.cutoffs} cutoff rows -> ${n} total in DB`
   );
+  await mongoClient.close();
   process.exit(0);
 }
 
-// Run main() only when invoked directly as a CLI (not when imported).
 if (process.argv[1] && /load-cutoffs\.ts$/.test(process.argv[1])) {
-  main().catch((e) => {
-    console.error(e);
-    process.exit(1);
-  });
+  main().catch((e) => { console.error(e); process.exit(1); });
 }

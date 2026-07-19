@@ -1,6 +1,6 @@
-import { db } from "@/db";
-import { threads, threadReplies, branches, colleges } from "@/db/schema";
-import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
+import { collections } from "@/db/collections";
+import type { Filter } from "mongodb";
+import type { ThreadDoc } from "@/db/collections";
 
 export interface ThreadListItem {
   id: number;
@@ -18,61 +18,91 @@ export async function getThreads(filter?: {
   scopeType?: string;
   scopeValue?: string;
 }): Promise<ThreadListItem[]> {
-  const conds = [];
-  if (filter?.scopeType) conds.push(eq(threads.scopeType, filter.scopeType));
-  if (filter?.scopeValue) conds.push(eq(threads.scopeValue, filter.scopeValue));
-  return db
-    .select({
-      id: threads.id,
-      scopeType: threads.scopeType,
-      scopeValue: threads.scopeValue,
-      title: threads.title,
-      authorName: threads.authorName,
-      replyCount: threads.replyCount,
-      createdAt: threads.createdAt,
-      lastActivityAt: threads.lastActivityAt,
-    })
-    .from(threads)
-    .where(conds.length ? and(...conds) : undefined)
-    .orderBy(desc(threads.lastActivityAt))
-    .limit(100);
+  const q: Filter<ThreadDoc> = {};
+  if (filter?.scopeType) q.scopeType = filter.scopeType;
+  if (filter?.scopeValue) q.scopeValue = filter.scopeValue;
+  const rows = await collections
+    .threads()
+    .find(q)
+    .sort({ lastActivityAt: -1 })
+    .limit(100)
+    .toArray();
+  return rows.map((t) => ({
+    id: t._id,
+    scopeType: t.scopeType,
+    scopeValue: t.scopeValue,
+    title: t.title,
+    authorName: t.authorName,
+    replyCount: t.replyCount,
+    createdAt: t.createdAt,
+    lastActivityAt: t.lastActivityAt,
+  }));
 }
 
 export async function getThread(id: number) {
-  const [thread] = await db.select().from(threads).where(eq(threads.id, id));
-  if (!thread) return null;
-  const replies = await db
-    .select()
-    .from(threadReplies)
-    .where(eq(threadReplies.threadId, id))
-    .orderBy(threadReplies.createdAt);
+  const t = await collections.threads().findOne({ _id: id });
+  if (!t) return null;
+  const replyDocs = await collections
+    .threadReplies()
+    .find({ threadId: id })
+    .sort({ createdAt: 1 })
+    .toArray();
+  const thread = {
+    id: t._id,
+    scopeType: t.scopeType,
+    scopeValue: t.scopeValue,
+    title: t.title,
+    body: t.body,
+    authorId: t.authorId,
+    authorName: t.authorName,
+    replyCount: t.replyCount,
+    createdAt: t.createdAt,
+    lastActivityAt: t.lastActivityAt,
+  };
+  const replies = replyDocs.map((r) => ({
+    id: r._id,
+    threadId: r.threadId,
+    body: r.body,
+    authorId: r.authorId,
+    authorName: r.authorName,
+    createdAt: r.createdAt,
+  }));
   return { thread, replies };
 }
 
 /** Branch + city options for the scope pickers, and per-scope thread counts. */
 export async function getScopeOptions() {
-  const [branchRows, cityRows, counts] = await Promise.all([
-    db.select({ name: branches.name }).from(branches).orderBy(branches.name),
-    db
-      .selectDistinct({ city: colleges.city })
-      .from(colleges)
-      .where(isNotNull(colleges.city))
-      .orderBy(colleges.city),
-    db
-      .select({
-        scopeType: threads.scopeType,
-        scopeValue: threads.scopeValue,
-        n: sql<number>`count(*)::int`,
-      })
-      .from(threads)
-      .groupBy(threads.scopeType, threads.scopeValue),
+  const [branchDocs, cities, counts] = await Promise.all([
+    collections.branches().find({}, { projection: { name: 1 } }).toArray(),
+    collections.colleges().distinct("city", { city: { $ne: null } }),
+    collections
+      .threads()
+      .aggregate<{ scopeType: string; scopeValue: string; n: number }>([
+        {
+          $group: {
+            _id: { scopeType: "$scopeType", scopeValue: "$scopeValue" },
+            n: { $sum: 1 },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            scopeType: "$_id.scopeType",
+            scopeValue: "$_id.scopeValue",
+            n: 1,
+          },
+        },
+      ])
+      .toArray(),
   ]);
-  const countMap = new Map(
-    counts.map((c) => [`${c.scopeType}|${c.scopeValue}`, c.n])
-  );
+  const countMap = new Map(counts.map((c) => [`${c.scopeType}|${c.scopeValue}`, c.n]));
   return {
-    branches: branchRows.map((b) => b.name),
-    cities: cityRows.map((c) => c.city as string),
+    branches: branchDocs
+      .map((b) => b.name)
+      .sort((a, b) => a.localeCompare(b)),
+    cities: (cities as (string | null)[])
+      .filter((c): c is string => c != null)
+      .sort((a, b) => a.localeCompare(b)),
     countFor: (t: string, v: string) => countMap.get(`${t}|${v}`) ?? 0,
   };
 }

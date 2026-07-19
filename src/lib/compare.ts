@@ -1,16 +1,4 @@
-import { db } from "@/db";
-import { sql, inArray, and, eq, isNotNull } from "drizzle-orm";
-import {
-  colleges,
-  universities,
-  collegeBranches,
-  branches,
-  cutoffs,
-  categories,
-  nirfRankings,
-  placements,
-  collegeDocuments,
-} from "@/db/schema";
+import { collections } from "@/db/collections";
 
 export interface CompareCollege {
   id: number;
@@ -42,113 +30,101 @@ export interface CompareCollege {
 
 /** Lightweight list of all colleges for the compare picker/typeahead. */
 export async function getCollegesLite() {
-  return db
-    .select({ id: colleges.id, name: colleges.name, city: colleges.city })
-    .from(colleges)
-    .where(eq(colleges.hidden, false))
-    .orderBy(colleges.name);
+  const cols = await collections
+    .colleges()
+    .find({ hidden: false }, { projection: { name: 1, city: 1 } })
+    .toArray();
+  return cols
+    .map((c) => ({ id: c._id, name: c.name, city: c.city }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** College-level comparison payload for the selected colleges (keeps input order). */
-export async function getCompareColleges(
-  ids: number[]
-): Promise<CompareCollege[]> {
+export async function getCompareColleges(ids: number[]): Promise<CompareCollege[]> {
   if (ids.length === 0) return [];
 
-  const base = await db
-    .select({
-      id: colleges.id,
-      name: colleges.name,
-      slug: colleges.slug,
-      city: colleges.city,
-      university: universities.name,
-      type: colleges.type,
-      isAutonomous: colleges.isAutonomous,
-      aicteApproved: colleges.aicteApproved,
-      naacGrade: colleges.naacGrade,
-      naacCgpa: colleges.naacCgpa,
-      campusAcres: colleges.campusAcres,
-      totalSeats: sql<number>`coalesce((select sum(total_intake) from ${collegeBranches} cb where cb.college_id = ${colleges.id}),0)::int`,
-      branchCount: sql<number>`(select count(*) from ${collegeBranches} cb where cb.college_id = ${colleges.id})::int`,
-      topCutoff: sql<number | null>`(select max(cu.closing_percentile) from ${collegeBranches} cb join ${cutoffs} cu on cu.college_branch_id = cb.id join ${categories} cat on cat.id = cu.category_id where cb.college_id = ${colleges.id} and cu.year = 2025 and cat.code = 'GOPEN' and cu.verified_at is not null)::float`,
-    })
-    .from(colleges)
-    .leftJoin(universities, eq(colleges.homeUniversityId, universities.id))
-    .where(and(inArray(colleges.id, ids), eq(colleges.hidden, false)));
+  const [cols, seatAgg, cutAgg] = await Promise.all([
+    collections.colleges().find({ _id: { $in: ids }, hidden: false }).toArray(),
+    collections
+      .offerings()
+      .aggregate<{ _id: number; totalSeats: number; branchCount: number }>([
+        { $match: { collegeId: { $in: ids } } },
+        {
+          $group: {
+            _id: "$collegeId",
+            totalSeats: { $sum: { $ifNull: ["$totalIntake", 0] } },
+            branchCount: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray(),
+    collections
+      .cutoffs()
+      .aggregate<{ _id: number; topCutoff: number }>([
+        {
+          $match: {
+            collegeId: { $in: ids },
+            year: 2025,
+            categoryCode: "GOPEN",
+            verifiedAt: { $ne: null },
+          },
+        },
+        { $group: { _id: "$collegeId", topCutoff: { $max: "$closingPercentile" } } },
+      ])
+      .toArray(),
+  ]);
 
-  const nirf = await db
-    .select({
-      collegeId: nirfRankings.collegeId,
-      year: nirfRankings.year,
-      rank: nirfRankings.rank,
-      band: nirfRankings.band,
-    })
-    .from(nirfRankings)
-    .where(inArray(nirfRankings.collegeId, ids))
-    .orderBy(nirfRankings.year);
+  const seatById = new Map(seatAgg.map((s) => [s._id, s]));
+  const cutById = new Map(cutAgg.map((c) => [c._id, c.topCutoff]));
+  const byId = new Map(cols.map((c) => [c._id, c]));
 
-  const place = await db
-    .select({
-      collegeId: placements.collegeId,
-      year: placements.year,
-      median: placements.medianPackageLpa,
-      highest: placements.highestPackageLpa,
-      rate: placements.placementRatePct,
-      recruiters: placements.topRecruiters,
-    })
-    .from(placements)
-    .where(
-      and(inArray(placements.collegeId, ids), isNotNull(placements.verifiedAt))
-    )
-    .orderBy(placements.year);
-
-  const docs = await db
-    .select({
-      collegeId: collegeDocuments.collegeId,
-      docType: collegeDocuments.docType,
-      year: collegeDocuments.year,
-      title: collegeDocuments.title,
-      url: collegeDocuments.url,
-    })
-    .from(collegeDocuments)
-    .where(
-      and(
-        inArray(collegeDocuments.collegeId, ids),
-        inArray(collegeDocuments.docType, ["cutoff", "institutional"])
-      )
-    )
-    .orderBy(collegeDocuments.year);
-
-  const byId = new Map(base.map((b) => [b.id, b]));
   return ids
     .map((id) => byId.get(id))
-    .filter((b): b is (typeof base)[number] => !!b)
-    .map((b) => {
-      const nirfRows = nirf
-        .filter((n) => n.collegeId === b.id)
+    .filter((c): c is NonNullable<typeof c> => !!c)
+    .map((c) => {
+      const nirfRows = (c.nirfRankings ?? [])
+        .slice()
+        .sort((a, b) => a.year - b.year)
         .map((n) => ({ year: n.year, rank: n.rank, band: n.band }));
-      const placeRows = place.filter((p) => p.collegeId === b.id);
+      const placeRows = (c.placements ?? [])
+        .filter((p) => p.verifiedAt != null)
+        .sort((a, b) => a.year - b.year);
       const latestPlace = placeRows[placeRows.length - 1];
       return {
-        ...b,
-        naacCgpa: b.naacCgpa == null ? null : Number(b.naacCgpa),
-        campusAcres: b.campusAcres == null ? null : Number(b.campusAcres),
+        id: c._id,
+        name: c.name,
+        slug: c.slug,
+        city: c.city,
+        university: c.homeUniversityName,
+        type: c.type,
+        isAutonomous: c.isAutonomous,
+        aicteApproved: c.aicteApproved,
+        naacGrade: c.naacGrade,
+        naacCgpa: c.naacCgpa,
+        campusAcres: c.campusAcres,
+        totalSeats: seatById.get(c._id)?.totalSeats ?? 0,
+        branchCount: seatById.get(c._id)?.branchCount ?? 0,
+        topCutoff: cutById.get(c._id) ?? null,
         nirf: nirfRows,
         latestNirf:
           nirfRows.length > 0
-            ? { rank: nirfRows[nirfRows.length - 1].rank, band: nirfRows[nirfRows.length - 1].band }
+            ? {
+                rank: nirfRows[nirfRows.length - 1].rank,
+                band: nirfRows[nirfRows.length - 1].band,
+              }
             : null,
         placement: latestPlace
           ? {
               year: latestPlace.year,
-              median: latestPlace.median == null ? null : Number(latestPlace.median),
-              highest: latestPlace.highest == null ? null : Number(latestPlace.highest),
-              rate: latestPlace.rate == null ? null : Number(latestPlace.rate),
-              recruiters: latestPlace.recruiters,
+              median: latestPlace.medianPackageLpa,
+              highest: latestPlace.highestPackageLpa,
+              rate: latestPlace.placementRatePct,
+              recruiters: latestPlace.topRecruiters,
             }
           : null,
-        cutoffDocs: docs
-          .filter((d) => d.collegeId === b.id)
+        cutoffDocs: (c.documents ?? [])
+          .filter((d) => d.docType === "cutoff" || d.docType === "institutional")
+          .sort((a, b) => (a.year ?? 0) - (b.year ?? 0))
           .map((d) => ({ docType: d.docType, year: d.year, title: d.title, url: d.url })),
       };
     });
@@ -168,32 +144,24 @@ export async function getCompareBranch(
   branchId: number
 ): Promise<{ year: number | null; seats: Map<number, number | null>; cells: BranchCompareCell[] }> {
   if (ids.length === 0) return { year: null, seats: new Map(), cells: [] };
-  const rows = await db
-    .select({
-      collegeId: collegeBranches.collegeId,
-      year: cutoffs.year,
-      categoryCode: categories.code,
-      seatType: cutoffs.seatType,
-      closingPercentile: cutoffs.closingPercentile,
-      closingMeritNo: cutoffs.closingMeritNo,
-    })
-    .from(cutoffs)
-    .innerJoin(collegeBranches, eq(cutoffs.collegeBranchId, collegeBranches.id))
-    .innerJoin(categories, eq(cutoffs.categoryId, categories.id))
-    .where(
-      and(
-        eq(collegeBranches.branchId, branchId),
-        inArray(collegeBranches.collegeId, ids),
-        isNotNull(cutoffs.verifiedAt)
+
+  const [rows, seatRows] = await Promise.all([
+    collections
+      .cutoffs()
+      .find({ branchId, collegeId: { $in: ids }, verifiedAt: { $ne: null } })
+      .toArray(),
+    collections
+      .offerings()
+      .find(
+        { branchId, collegeId: { $in: ids } },
+        { projection: { collegeId: 1, totalIntake: 1 } }
       )
-    );
-  const seatsRows = await db
-    .select({ collegeId: collegeBranches.collegeId, intake: collegeBranches.totalIntake })
-    .from(collegeBranches)
-    .where(
-      and(eq(collegeBranches.branchId, branchId), inArray(collegeBranches.collegeId, ids))
-    );
-  const seats = new Map(seatsRows.map((s) => [s.collegeId, s.intake]));
+      .toArray(),
+  ]);
+
+  const seats = new Map<number, number | null>(
+    seatRows.map((s) => [s.collegeId, s.totalIntake])
+  );
   if (rows.length === 0) return { year: null, seats, cells: [] };
   const latestYear = Math.max(...rows.map((r) => r.year));
   return {
@@ -202,10 +170,11 @@ export async function getCompareBranch(
     cells: rows
       .filter((r) => r.year === latestYear)
       .map((r) => ({
-        collegeId: r.collegeId,
+        collegeId: r.collegeId as number,
         categoryCode: r.categoryCode,
         seatType: r.seatType as string,
-        closingPercentile: r.closingPercentile == null ? null : Number(r.closingPercentile),
+        closingPercentile:
+          r.closingPercentile == null ? null : Number(r.closingPercentile),
         closingMeritNo: r.closingMeritNo,
       })),
   };
@@ -214,17 +183,19 @@ export async function getCompareBranch(
 /** Branches offered by ALL selected colleges (for the branch-compare picker). */
 export async function getCommonBranches(ids: number[]) {
   if (ids.length === 0) return [];
-  const rows = await db
-    .select({
-      id: branches.id,
-      name: branches.name,
-      n: sql<number>`count(distinct ${collegeBranches.collegeId})::int`,
-    })
-    .from(collegeBranches)
-    .innerJoin(branches, eq(collegeBranches.branchId, branches.id))
-    .where(inArray(collegeBranches.collegeId, ids))
-    .groupBy(branches.id, branches.name)
-    .orderBy(sql`count(distinct ${collegeBranches.collegeId}) desc`, branches.name);
-  // branches offered by more than one selected college first
-  return rows.map((r) => ({ id: r.id, name: r.name, colleges: r.n }));
+  const [agg, branchDocs] = await Promise.all([
+    collections
+      .offerings()
+      .aggregate<{ _id: number; n: number }>([
+        { $match: { collegeId: { $in: ids } } },
+        { $group: { _id: "$branchId", colleges: { $addToSet: "$collegeId" } } },
+        { $project: { n: { $size: "$colleges" } } },
+      ])
+      .toArray(),
+    collections.branches().find({}, { projection: { name: 1 } }).toArray(),
+  ]);
+  const nameById = new Map(branchDocs.map((b) => [b._id, b.name]));
+  return agg
+    .map((a) => ({ id: a._id, name: nameById.get(a._id) ?? "", colleges: a.n }))
+    .sort((a, b) => b.colleges - a.colleges || a.name.localeCompare(b.name));
 }

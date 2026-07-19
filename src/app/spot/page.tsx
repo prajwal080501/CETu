@@ -1,5 +1,4 @@
-import { db } from "@/db";
-import { sql } from "drizzle-orm";
+import { collections } from "@/db/collections";
 import { SpotComingSoon } from "@/components/SpotComingSoon";
 
 export const dynamic = "force-dynamic";
@@ -11,11 +10,15 @@ export const metadata = {
 
 export default async function SpotPage() {
   // Count institute-level / SPOT / cutoff round PDFs we already reference.
-  const rows = (await db.execute(sql`
-    select count(*)::int as n from college_documents
-    where doc_type in ('institutional', 'cutoff')
-  `)) as unknown as { n: number }[];
-  const previewCount = rows[0]?.n ?? 0;
+  const [agg] = await collections
+    .colleges()
+    .aggregate<{ n: number }>([
+      { $unwind: "$documents" },
+      { $match: { "documents.docType": { $in: ["institutional", "cutoff"] } } },
+      { $count: "n" },
+    ])
+    .toArray();
+  const previewCount = agg?.n ?? 0;
 
   return <SpotComingSoon previewCount={previewCount} />;
 }

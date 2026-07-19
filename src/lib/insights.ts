@@ -1,8 +1,6 @@
 import "server-only";
 import { createHash } from "node:crypto";
-import { db } from "@/db";
-import { aiInsights } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { collections } from "@/db/collections";
 import {
   getCollegeBySlug,
   getCollegeOverview,
@@ -87,15 +85,12 @@ export function factsHash(facts: InsightFacts): string {
 export async function getCachedInsights(
   collegeId: number
 ): Promise<{ content: CollegeInsights; dataHash: string; model: string } | null> {
-  const [row] = await db
-    .select({
-      content: aiInsights.content,
-      dataHash: aiInsights.dataHash,
-      model: aiInsights.model,
-    })
-    .from(aiInsights)
-    .where(eq(aiInsights.collegeId, collegeId))
-    .limit(1);
+  const row = await collections
+    .aiInsights()
+    .findOne(
+      { collegeId },
+      { projection: { content: 1, dataHash: 1, model: 1 } }
+    );
   if (!row) return null;
   return {
     content: row.content as CollegeInsights,

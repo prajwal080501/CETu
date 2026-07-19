@@ -1,9 +1,7 @@
 "use server";
 
 import { auth } from "@clerk/nextjs/server";
-import { db } from "@/db";
-import { preferenceLists } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { collections } from "@/db/collections";
 import type { FlatResult } from "@/components/PredictorResults";
 
 /**
@@ -13,10 +11,7 @@ import type { FlatResult } from "@/components/PredictorResults";
 export async function loadPreferenceList(): Promise<FlatResult[]> {
   const { userId } = await auth();
   if (!userId) return [];
-  const [row] = await db
-    .select({ items: preferenceLists.items })
-    .from(preferenceLists)
-    .where(eq(preferenceLists.userId, userId));
+  const row = await collections.preferenceLists().findOne({ _id: userId });
   return (row?.items as FlatResult[]) ?? [];
 }
 
@@ -27,11 +22,11 @@ export async function loadPreferenceList(): Promise<FlatResult[]> {
 export async function savePreferenceList(items: FlatResult[]): Promise<void> {
   const { userId } = await auth();
   if (!userId) return;
-  await db
-    .insert(preferenceLists)
-    .values({ userId, items, updatedAt: new Date() })
-    .onConflictDoUpdate({
-      target: preferenceLists.userId,
-      set: { items, updatedAt: new Date() },
-    });
+  await collections
+    .preferenceLists()
+    .updateOne(
+      { _id: userId },
+      { $set: { items, updatedAt: new Date() } },
+      { upsert: true }
+    );
 }

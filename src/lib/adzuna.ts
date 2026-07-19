@@ -1,7 +1,5 @@
 import "server-only";
-import { db } from "@/db";
-import { jobMarket } from "@/db/schema";
-import { and, eq } from "drizzle-orm";
+import { collections } from "@/db/collections";
 import { roleForFamily } from "./branch-roles";
 
 /**
@@ -151,11 +149,11 @@ async function fetchFromAdzuna(
 
 /** Read cached rows for a family. */
 async function readCache(family: string) {
-  const rows = await db
-    .select({ kind: jobMarket.kind, payload: jobMarket.payload, fetchedAt: jobMarket.fetchedAt })
-    .from(jobMarket)
-    .where(eq(jobMarket.family, family));
-  return rows;
+  const rows = await collections
+    .jobMarket()
+    .find({ family }, { projection: { kind: 1, payload: 1, fetchedAt: 1 } })
+    .toArray();
+  return rows.map((r) => ({ kind: r.kind, payload: r.payload, fetchedAt: r.fetchedAt }));
 }
 
 async function writeCache(
@@ -163,13 +161,13 @@ async function writeCache(
   kind: string,
   payload: unknown
 ): Promise<void> {
-  await db
-    .insert(jobMarket)
-    .values({ family, kind, payload: payload as object, fetchedAt: new Date() })
-    .onConflictDoUpdate({
-      target: [jobMarket.family, jobMarket.kind],
-      set: { payload: payload as object, fetchedAt: new Date() },
-    });
+  await collections
+    .jobMarket()
+    .updateOne(
+      { family, kind },
+      { $set: { family, kind, payload, fetchedAt: new Date() } },
+      { upsert: true }
+    );
 }
 
 /**

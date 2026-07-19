@@ -1,9 +1,8 @@
 "use server";
 
 import { auth } from "@clerk/nextjs/server";
-import { db } from "@/db";
-import { threads, threadReplies } from "@/db/schema";
-import { eq, sql } from "drizzle-orm";
+import { collections } from "@/db/collections";
+import { nextId } from "@/db/ids";
 import { revalidatePath } from "next/cache";
 
 const SCOPES = new Set(["branch", "city", "general"]);
@@ -23,19 +22,22 @@ export async function createThread(input: {
   if (!title || title.length < 4) return { ok: false, error: "Add a longer title." };
   if (!body) return { ok: false, error: "Write something in the post." };
 
-  const [row] = await db
-    .insert(threads)
-    .values({
-      scopeType,
-      scopeValue: scopeType === "general" ? "" : (input.scopeValue ?? "").slice(0, 120),
-      title: title.slice(0, 200),
-      body: body.slice(0, 5000),
-      authorId: userId,
-      authorName: input.authorName?.slice(0, 80) ?? null,
-    })
-    .returning({ id: threads.id });
+  const id = await nextId("threads");
+  const now = new Date();
+  await collections.threads().insertOne({
+    _id: id,
+    scopeType,
+    scopeValue: scopeType === "general" ? "" : (input.scopeValue ?? "").slice(0, 120),
+    title: title.slice(0, 200),
+    body: body.slice(0, 5000),
+    authorId: userId,
+    authorName: input.authorName?.slice(0, 80) ?? null,
+    replyCount: 0,
+    createdAt: now,
+    lastActivityAt: now,
+  });
   revalidatePath("/discuss");
-  return { ok: true, id: row.id };
+  return { ok: true, id };
 }
 
 export async function createReply(input: {
@@ -48,19 +50,21 @@ export async function createReply(input: {
   const body = input.body?.trim();
   if (!body) return { ok: false, error: "Write a reply." };
 
-  await db.insert(threadReplies).values({
+  const id = await nextId("threadReplies");
+  await collections.threadReplies().insertOne({
+    _id: id,
     threadId: input.threadId,
     body: body.slice(0, 5000),
     authorId: userId,
     authorName: input.authorName?.slice(0, 80) ?? null,
+    createdAt: new Date(),
   });
-  await db
-    .update(threads)
-    .set({
-      replyCount: sql`${threads.replyCount} + 1`,
-      lastActivityAt: new Date(),
-    })
-    .where(eq(threads.id, input.threadId));
+  await collections
+    .threads()
+    .updateOne(
+      { _id: input.threadId },
+      { $inc: { replyCount: 1 }, $set: { lastActivityAt: new Date() } }
+    );
   revalidatePath(`/discuss/${input.threadId}`);
   revalidatePath("/discuss");
   return { ok: true };

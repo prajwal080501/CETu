@@ -1,114 +1,131 @@
-import { db } from "@/db";
-import {
-  colleges,
-  branches,
-  collegeBranches,
-  cutoffs,
-  universities,
-  placements,
-  alumni,
-  naacSubmissions,
-} from "@/db/schema";
-import { and, eq, isNull, isNotNull, sql, inArray } from "drizzle-orm";
+import { collections } from "@/db/collections";
 
 /** Unverified crowdsourced contributions awaiting moderation. */
 export async function getPendingContributions() {
-  const [pendPlacements, pendAlumni, pendNaac] = await Promise.all([
-    db
-      .select({
-        id: placements.id,
-        college: colleges.name,
-        year: placements.year,
-        median: placements.medianPackageLpa,
-        highest: placements.highestPackageLpa,
-        rate: placements.placementRatePct,
-        recruiters: placements.topRecruiters,
-        source: placements.source,
-      })
-      .from(placements)
-      .innerJoin(colleges, eq(placements.collegeId, colleges.id))
-      .where(isNull(placements.verifiedAt))
-      .orderBy(placements.id),
-    db
-      .select({
-        id: alumni.id,
-        college: colleges.name,
-        name: alumni.name,
-        achievement: alumni.achievement,
-      })
-      .from(alumni)
-      .innerJoin(colleges, eq(alumni.collegeId, colleges.id))
-      .where(isNull(alumni.verifiedAt))
-      .orderBy(alumni.id),
-    db
-      .select({
-        id: naacSubmissions.id,
-        college: colleges.name,
-        grade: naacSubmissions.grade,
-        cgpa: naacSubmissions.cgpa,
-        validUpto: naacSubmissions.validUpto,
-        source: naacSubmissions.source,
-      })
-      .from(naacSubmissions)
-      .innerJoin(colleges, eq(naacSubmissions.collegeId, colleges.id))
-      .orderBy(naacSubmissions.id),
+  const [pendPlacements, pendAlumni, naacDocs, collegeNames] = await Promise.all([
+    collections
+      .colleges()
+      .aggregate<{
+        id: number; college: string; year: number;
+        median: number | null; highest: number | null; rate: number | null;
+        recruiters: string | null; source: string | null;
+      }>([
+        { $unwind: "$placements" },
+        { $match: { "placements.verifiedAt": null } },
+        {
+          $project: {
+            _id: 0, id: "$placements.id", college: "$name", year: "$placements.year",
+            median: "$placements.medianPackageLpa", highest: "$placements.highestPackageLpa",
+            rate: "$placements.placementRatePct", recruiters: "$placements.topRecruiters",
+            source: "$placements.source",
+          },
+        },
+        { $sort: { id: 1 } },
+      ])
+      .toArray(),
+    collections
+      .colleges()
+      .aggregate<{ id: number; college: string; name: string; achievement: string | null }>([
+        { $unwind: "$alumni" },
+        { $match: { "alumni.verifiedAt": null } },
+        {
+          $project: {
+            _id: 0, id: "$alumni.id", college: "$name",
+            name: "$alumni.name", achievement: "$alumni.achievement",
+          },
+        },
+        { $sort: { id: 1 } },
+      ])
+      .toArray(),
+    collections.naacSubmissions().find({}).sort({ _id: 1 }).toArray(),
+    collections.colleges().find({}, { projection: { name: 1 } }).toArray(),
   ]);
+
+  const nameById = new Map(collegeNames.map((c) => [c._id, c.name]));
+  const pendNaac = naacDocs.map((n) => ({
+    id: n._id,
+    college: nameById.get(n.collegeId) ?? "",
+    grade: n.grade,
+    cgpa: n.cgpa,
+    validUpto: n.validUpto,
+    source: n.source,
+  }));
+
   return { placements: pendPlacements, alumni: pendAlumni, naac: pendNaac };
 }
 
 /** Pending cutoff ingestions (from admin PDF uploads) awaiting batch approval. */
 export async function getPendingCutoffBatches() {
-  const rows = await db.execute(sql`
-    select sd.id, sd.title, sd.year, sd.round,
-      count(*)::int as "pendingRows",
-      (array_agg(distinct c.name))[1:3] as "sampleColleges"
-    from source_documents sd
-    join cutoffs cu on cu.source_document_id = sd.id and cu.verified_at is null
-    join college_branches cb on cb.id = cu.college_branch_id
-    join colleges c on c.id = cb.college_id
-    where sd.doc_type = 'cutoff'
-    group by sd.id, sd.title, sd.year, sd.round
-    order by sd.id desc
-  `);
-  return rows as unknown as {
-    id: number;
-    title: string;
-    year: number;
-    round: number;
-    pendingRows: number;
-    sampleColleges: string[];
-  }[];
+  const [grouped, srcDocs, collegeNames] = await Promise.all([
+    collections
+      .cutoffs()
+      .aggregate<{ _id: number; pendingRows: number; collegeIds: number[] }>([
+        { $match: { verifiedAt: null, sourceDocumentId: { $ne: null } } },
+        {
+          $group: {
+            _id: "$sourceDocumentId",
+            pendingRows: { $sum: 1 },
+            collegeIds: { $addToSet: "$collegeId" },
+          },
+        },
+      ])
+      .toArray(),
+    collections.sourceDocuments().find({ docType: "cutoff" }).toArray(),
+    collections.colleges().find({}, { projection: { name: 1 } }).toArray(),
+  ]);
+
+  const srcById = new Map(srcDocs.map((s) => [s._id, s]));
+  const nameById = new Map(collegeNames.map((c) => [c._id, c.name]));
+
+  return grouped
+    .filter((g) => srcById.has(g._id))
+    .map((g) => {
+      const sd = srcById.get(g._id)!;
+      return {
+        id: g._id,
+        title: sd.title,
+        year: sd.year,
+        round: sd.round as number,
+        pendingRows: g.pendingRows,
+        sampleColleges: g.collegeIds
+          .slice(0, 3)
+          .map((cid) => nameById.get(cid) ?? "")
+          .filter(Boolean),
+      };
+    })
+    .sort((a, b) => b.id - a.id);
 }
 
 /** Top-line pipeline totals for the admin dashboard. */
 export async function getPipelineStats() {
-  const [totals] = await db
-    .select({
-      cutoffs: sql<number>`count(*)::int`,
-      verified: sql<number>`count(*) filter (where ${cutoffs.verifiedAt} is not null)::int`,
-    })
-    .from(cutoffs);
+  const [cutoffCount, verified, collegeCount, branchCount, offeringCount, univCount, byYear] =
+    await Promise.all([
+      collections.cutoffs().countDocuments(),
+      collections.cutoffs().countDocuments({ verifiedAt: { $ne: null } }),
+      collections.colleges().countDocuments(),
+      collections.branches().countDocuments(),
+      collections.offerings().countDocuments(),
+      collections.universities().countDocuments(),
+      collections
+        .cutoffs()
+        .aggregate<{ year: number; round: number; rows: number }>([
+          { $group: { _id: "$year", round: { $max: "$round" }, rows: { $sum: 1 } } },
+          { $project: { _id: 0, year: "$_id", round: 1, rows: 1 } },
+          { $sort: { year: 1 } },
+        ])
+        .toArray(),
+    ]);
 
-  const [counts] = await db
-    .select({
-      colleges: sql<number>`(select count(*) from ${colleges})::int`,
-      branches: sql<number>`(select count(*) from ${branches})::int`,
-      offerings: sql<number>`(select count(*) from ${collegeBranches})::int`,
-      universities: sql<number>`(select count(*) from ${universities})::int`,
-    })
-    .from(sql`(select 1) as _`);
-
-  const byYear = await db
-    .select({
-      year: cutoffs.year,
-      round: sql<number>`max(${cutoffs.round})::int`,
-      rows: sql<number>`count(*)::int`,
-    })
-    .from(cutoffs)
-    .groupBy(cutoffs.year)
-    .orderBy(cutoffs.year);
-
-  return { totals, counts, byYear };
+  return {
+    totals: { cutoffs: cutoffCount, verified },
+    counts: {
+      colleges: collegeCount,
+      branches: branchCount,
+      offerings: offeringCount,
+      universities: univCount,
+    },
+    byYear,
+  };
 }
 
 /**
@@ -116,46 +133,41 @@ export async function getPipelineStats() {
  * data gap a curator should resolve (needs the DTE institute directory).
  */
 export async function getCollegesMissingUniversity() {
-  const rows = await db
-    .selectDistinct({
-      id: colleges.id,
-      name: colleges.name,
-      city: colleges.city,
-      dteCode: colleges.dteCode,
-    })
-    .from(colleges)
-    .innerJoin(collegeBranches, eq(collegeBranches.collegeId, colleges.id))
-    .innerJoin(cutoffs, eq(cutoffs.collegeBranchId, collegeBranches.id))
-    .where(
-      and(
-        isNull(colleges.homeUniversityId),
-        inArray(cutoffs.seatType, ["HU", "OHU", "HU_OHU"])
-      )
+  const collegeIds = await collections
+    .cutoffs()
+    .distinct("collegeId", {
+      collegeHomeUniversityId: null,
+      seatType: { $in: ["HU", "OHU", "HU_OHU"] },
+    });
+  const cols = await collections
+    .colleges()
+    .find(
+      { _id: { $in: collegeIds as number[] } },
+      { projection: { name: 1, city: 1, dteCode: 1 } }
     )
-    .orderBy(colleges.name);
-  return rows;
+    .toArray();
+  return cols
+    .map((c) => ({ id: c._id, name: c.name, city: c.city, dteCode: c.dteCode }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Branches that fell through classification into "Other" (review candidates). */
 export async function getUnclassifiedBranches() {
-  return db
-    .select({ id: branches.id, name: branches.name, family: branches.family })
-    .from(branches)
-    .where(sql`${branches.family} = 'Other' or ${branches.family} is null`)
-    .orderBy(branches.name);
+  const rows = await collections
+    .branches()
+    .find({ $or: [{ family: "Other" }, { family: null }] })
+    .toArray();
+  return rows
+    .map((b) => ({ id: b._id, name: b.name, family: b.family }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Coverage: colleges with a home university and with a city. */
 export async function getCoverage() {
-  const [row] = await db
-    .select({
-      withUniversity: sql<number>`count(*) filter (where ${colleges.homeUniversityId} is not null)::int`,
-      withCity: sql<number>`count(*) filter (where ${colleges.city} is not null)::int`,
-      total: sql<number>`count(*)::int`,
-    })
-    .from(colleges);
-  return row;
+  const [withUniversity, withCity, total] = await Promise.all([
+    collections.colleges().countDocuments({ homeUniversityId: { $ne: null } }),
+    collections.colleges().countDocuments({ city: { $ne: null } }),
+    collections.colleges().countDocuments(),
+  ]);
+  return { withUniversity, withCity, total };
 }
-
-// keep imports honest
-void isNotNull;

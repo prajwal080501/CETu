@@ -15,9 +15,9 @@ type PendingPlacement = {
   id: number;
   college: string;
   year: number;
-  median: string | null;
-  highest: string | null;
-  rate: string | null;
+  median: number | null;
+  highest: number | null;
+  rate: number | null;
   recruiters: string | null;
   source: string | null;
 };
@@ -31,7 +31,7 @@ type PendingNaac = {
   id: number;
   college: string;
   grade: string;
-  cgpa: string | null;
+  cgpa: number | null;
   validUpto: string | null;
   source: string | null;
 };

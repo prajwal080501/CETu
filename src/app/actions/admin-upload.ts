@@ -1,9 +1,8 @@
 "use server";
 
 import { requireAdminSession } from "@/lib/admin-auth";
-import { db } from "@/db";
-import { collegeDocuments, sourceDocuments, cutoffs, colleges } from "@/db/schema";
-import { and, eq, isNull } from "drizzle-orm";
+import { collections } from "@/db/collections";
+import { nextId } from "@/db/ids";
 import { revalidatePath } from "next/cache";
 import { putPdf, makeKey, s3Enabled } from "@/lib/s3";
 import { loadCutoffRows, type ParsedRow } from "@/db/load-cutoffs";
@@ -67,18 +66,24 @@ export async function uploadCollegeDocument(formData: FormData) {
   try {
     const key = makeKey(`docs/${collegeId}`, file!.name);
     await putPdf(key, buf);
-    await db.insert(collegeDocuments).values({
-      collegeId,
-      docType,
-      year,
-      title,
-      url: key, // S3 key — resolved to a presigned URL on read
-    });
-    const [c] = await db
-      .select({ slug: colleges.slug })
-      .from(colleges)
-      .where(eq(colleges.id, collegeId))
-      .limit(1);
+    const id = await nextId("documents");
+    const c = await collections.colleges().findOneAndUpdate(
+      { _id: collegeId },
+      {
+        $push: {
+          documents: {
+            id,
+            docType,
+            year,
+            title,
+            url: key, // S3 key — resolved to a presigned URL on read
+            sourcePage: null,
+            createdAt: new Date(),
+          },
+        },
+      },
+      { projection: { slug: 1 }, returnDocument: "after" }
+    );
     if (c) revalidatePath(`/colleges/${c.slug}`);
     revalidatePath("/admin");
     return { ok: true };
@@ -120,19 +125,18 @@ export async function ingestCutoffPdf(formData: FormData) {
     const sha256 = createHash("sha256").update(buf).digest("hex");
 
     // 2. Provenance record.
-    const [src] = await db
-      .insert(sourceDocuments)
-      .values({
-        title: title || `Cutoff ${year} Round ${round} — ${file!.name}`,
-        sourceUrl: key,
-        storagePath: key,
-        year,
-        round,
-        docType: "cutoff",
-        sha256,
-      })
-      .returning({ id: sourceDocuments.id });
-    sourceDocId = src.id;
+    sourceDocId = await nextId("sourceDocuments");
+    await collections.sourceDocuments().insertOne({
+      _id: sourceDocId,
+      title: title || `Cutoff ${year} Round ${round} — ${file!.name}`,
+      sourceUrl: key,
+      storagePath: key,
+      year,
+      round,
+      docType: "cutoff",
+      sha256,
+      ingestedAt: new Date(),
+    });
 
     // 3. Parse with the validated Python parser (needs a local path).
     await writeFile(tmpPdf, buf);
@@ -157,7 +161,7 @@ export async function ingestCutoffPdf(formData: FormData) {
   } catch (e) {
     // Roll back the provenance row so a failed parse doesn't leave an orphan.
     if (sourceDocId != null)
-      await db.delete(sourceDocuments).where(eq(sourceDocuments.id, sourceDocId)).catch(() => {});
+      await collections.sourceDocuments().deleteOne({ _id: sourceDocId }).catch(() => {});
     console.error("ingestCutoffPdf failed:", e);
     const msg = (e as Error).message || "Ingestion failed.";
     if (/ENOENT|python3/.test(msg))
@@ -174,20 +178,20 @@ export async function ingestCutoffPdf(formData: FormData) {
 
 export async function approveCutoffBatch(sourceDocumentId: number) {
   await requireAdmin();
-  await db
-    .update(cutoffs)
-    .set({ verifiedAt: new Date() })
-    .where(and(eq(cutoffs.sourceDocumentId, sourceDocumentId), isNull(cutoffs.verifiedAt)));
+  await collections
+    .cutoffs()
+    .updateMany(
+      { sourceDocumentId, verifiedAt: null },
+      { $set: { verifiedAt: new Date() } }
+    );
   revalidatePath("/admin");
   return { ok: true };
 }
 
 export async function rejectCutoffBatch(sourceDocumentId: number) {
   await requireAdmin();
-  await db
-    .delete(cutoffs)
-    .where(and(eq(cutoffs.sourceDocumentId, sourceDocumentId), isNull(cutoffs.verifiedAt)));
-  await db.delete(sourceDocuments).where(eq(sourceDocuments.id, sourceDocumentId));
+  await collections.cutoffs().deleteMany({ sourceDocumentId, verifiedAt: null });
+  await collections.sourceDocuments().deleteOne({ _id: sourceDocumentId });
   revalidatePath("/admin");
   return { ok: true };
 }

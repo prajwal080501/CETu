@@ -1,20 +1,18 @@
 "use server";
 
 import { requireAdminSession } from "@/lib/admin-auth";
-import { db } from "@/db";
-import { colleges, collegeBranches, branches, fees } from "@/db/schema";
-import { and, eq } from "drizzle-orm";
+import { collections, type CollegeDoc } from "@/db/collections";
+import { nextId } from "@/db/ids";
+import type { UpdateFilter } from "mongodb";
 import { revalidatePath } from "next/cache";
 
 const FEE_YEAR = 2025; // shared with the display query (see lib/queries.ts)
 const NAAC_GRADES = ["A++", "A+", "A", "B++", "B+", "B", "C"];
 
 async function slugOf(collegeId: number) {
-  const [c] = await db
-    .select({ slug: colleges.slug })
-    .from(colleges)
-    .where(eq(colleges.id, collegeId))
-    .limit(1);
+  const c = await collections
+    .colleges()
+    .findOne({ _id: collegeId }, { projection: { slug: 1 } });
   return c?.slug ?? null;
 }
 
@@ -39,15 +37,10 @@ export async function setCollegeNaac(formData: FormData) {
   const validUpto = (String(formData.get("validUpto") || "").trim() || null) as string | null;
   const source = (String(formData.get("source") || "").trim() || null) as string | null;
 
-  await db
-    .update(colleges)
-    .set({
-      naacGrade: grade,
-      naacCgpa: cgpa?.toString() ?? null,
-      naacValidUpto: validUpto,
-      naacSource: source,
-    })
-    .where(eq(colleges.id, collegeId));
+  await collections.colleges().updateOne(
+    { _id: collegeId },
+    { $set: { naacGrade: grade, naacCgpa: cgpa, naacValidUpto: validUpto, naacSource: source } }
+  );
   await revalidateCollege(collegeId);
   return { ok: true };
 }
@@ -59,10 +52,9 @@ export async function setCollegeAvgFee(collegeId: number, amount: number | null)
   if (!collegeId) return { ok: false, error: "Pick a college." };
   if (amount != null && (amount < 0 || amount > 10_000_000))
     return { ok: false, error: "Enter a sensible annual fee in ₹." };
-  await db
-    .update(colleges)
-    .set({ avgFeeAnnual: amount ?? null })
-    .where(eq(colleges.id, collegeId));
+  await collections
+    .colleges()
+    .updateOne({ _id: collegeId }, { $set: { avgFeeAnnual: amount ?? null } });
   await revalidateCollege(collegeId);
   return { ok: true };
 }
@@ -72,25 +64,24 @@ export async function setCollegeAvgFee(collegeId: number, amount: number | null)
 /** The college's branches with any current fee, for the admin fee editor. */
 export async function getBranchFees(collegeId: number) {
   await requireAdminSession();
-  const rows = await db
-    .select({
-      collegeBranchId: collegeBranches.id,
-      branchName: branches.name,
-      fee: fees.annualTuition,
-    })
-    .from(collegeBranches)
-    .innerJoin(branches, eq(branches.id, collegeBranches.branchId))
-    .leftJoin(
-      fees,
-      and(
-        eq(fees.collegeBranchId, collegeBranches.id),
-        eq(fees.year, FEE_YEAR),
-        eq(fees.categoryGroup, "open")
-      )
-    )
-    .where(eq(collegeBranches.collegeId, collegeId))
-    .orderBy(branches.name);
-  return rows;
+  const [offerings, branchDocs, college] = await Promise.all([
+    collections.offerings().find({ collegeId }).toArray(),
+    collections.branches().find({}, { projection: { name: 1 } }).toArray(),
+    collections.colleges().findOne({ _id: collegeId }, { projection: { fees: 1 } }),
+  ]);
+  const nameById = new Map(branchDocs.map((b) => [b._id, b.name]));
+  const feeFor = new Map<number, number | null>();
+  for (const f of college?.fees ?? []) {
+    if (f.year === FEE_YEAR && f.categoryGroup === "open")
+      feeFor.set(f.collegeBranchId, f.annualTuition);
+  }
+  return offerings
+    .map((o) => ({
+      collegeBranchId: o._id,
+      branchName: nameById.get(o.branchId) ?? o.branchName,
+      fee: feeFor.get(o._id) ?? null,
+    }))
+    .sort((a, b) => a.branchName.localeCompare(b.branchName));
 }
 
 /** Upsert branch fees (amount in ₹). Blank/0 removes that branch's fee. */
@@ -100,33 +91,61 @@ export async function setBranchFees(
 ) {
   await requireAdminSession();
   if (!collegeId || !rows?.length) return { ok: false, error: "Nothing to save." };
+
+  const college = await collections
+    .colleges()
+    .findOne({ _id: collegeId }, { projection: { fees: 1 } });
+  const existing = new Set(
+    (college?.fees ?? [])
+      .filter((f) => f.year === FEE_YEAR && f.categoryGroup === "open")
+      .map((f) => f.collegeBranchId)
+  );
+
   let saved = 0;
   for (const r of rows) {
     if (!r.collegeBranchId) continue;
     if (r.amount == null || r.amount <= 0) {
-      await db
-        .delete(fees)
-        .where(
-          and(
-            eq(fees.collegeBranchId, r.collegeBranchId),
-            eq(fees.year, FEE_YEAR),
-            eq(fees.categoryGroup, "open")
-          )
-        );
+      await collections.colleges().updateOne(
+        { _id: collegeId },
+        {
+          $pull: {
+            fees: { collegeBranchId: r.collegeBranchId, year: FEE_YEAR, categoryGroup: "open" },
+          },
+        } as unknown as UpdateFilter<CollegeDoc>
+      );
+      existing.delete(r.collegeBranchId);
       continue;
     }
-    await db
-      .insert(fees)
-      .values({
-        collegeBranchId: r.collegeBranchId,
-        year: FEE_YEAR,
-        categoryGroup: "open",
-        annualTuition: Math.round(r.amount),
-      })
-      .onConflictDoUpdate({
-        target: [fees.collegeBranchId, fees.year, fees.categoryGroup],
-        set: { annualTuition: Math.round(r.amount) },
-      });
+    const amt = Math.round(r.amount);
+    if (existing.has(r.collegeBranchId)) {
+      await collections.colleges().updateOne(
+        { _id: collegeId },
+        { $set: { "fees.$[e].annualTuition": amt } } as unknown as UpdateFilter<CollegeDoc>,
+        {
+          arrayFilters: [
+            { "e.collegeBranchId": r.collegeBranchId, "e.year": FEE_YEAR, "e.categoryGroup": "open" },
+          ],
+        }
+      );
+    } else {
+      const id = await nextId("fees");
+      await collections.colleges().updateOne(
+        { _id: collegeId },
+        {
+          $push: {
+            fees: {
+              id,
+              collegeBranchId: r.collegeBranchId,
+              year: FEE_YEAR,
+              categoryGroup: "open",
+              annualTuition: amt,
+              source: null,
+            },
+          },
+        }
+      );
+      existing.add(r.collegeBranchId);
+    }
     saved++;
   }
   await revalidateCollege(collegeId);

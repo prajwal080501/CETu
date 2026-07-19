@@ -1,6 +1,5 @@
-import { db } from "@/db";
-import { sql } from "drizzle-orm";
-import { unstable_cache } from "next/cache";
+import { cached } from "./query-cache";
+import { collections } from "@/db/collections";
 
 // Branch analytics are derived from verified CAP data that only changes on
 // ingestion — cache them so every page view doesn't re-scan the cutoffs table.
@@ -27,35 +26,66 @@ export interface BranchListItem {
 }
 
 /** All branches that have at least one offering, with headline stats. */
-export const listBranches = unstable_cache(
+export const listBranches = cached(
   async (): Promise<BranchListItem[]> => {
-    // Compute each branch's avg GOPEN closing percentile once (grouped scan)
-    // instead of a correlated subquery per branch, then join it on.
-    const rows = await db.execute(sql`
-      with demand as (
-        select cb.branch_id, avg(cu.closing_percentile)::float as avg_cutoff
-        from cutoffs cu
-        join college_branches cb on cb.id = cu.college_branch_id
-        join categories cat on cat.id = cu.category_id
-        where cu.year = ${YEAR} and cat.code = 'GOPEN'
-          and cu.verified_at is not null
-        group by cb.branch_id
-      )
-      select b.id, b.name, b.slug, b.family,
-        count(distinct cb.college_id)::int as colleges,
-        coalesce(sum(cb.total_intake), 0)::int as seats,
-        d.avg_cutoff as "avgCutoff"
-      from branches b
-      join college_branches cb on cb.branch_id = b.id
-      left join demand d on d.branch_id = b.id
-      group by b.id, b.name, b.slug, b.family, d.avg_cutoff
-      having count(distinct cb.college_id) > 0
-      order by seats desc, colleges desc
-    `);
-    return rows as unknown as BranchListItem[];
+    const [offAgg, demand, branches] = await Promise.all([
+      // colleges (= distinct offerings, unique per college×branch) + seats
+      collections
+        .offerings()
+        .aggregate<{ _id: number; colleges: number; seats: number }>([
+          {
+            $group: {
+              _id: "$branchId",
+              colleges: { $sum: 1 },
+              seats: { $sum: { $ifNull: ["$totalIntake", 0] } },
+            },
+          },
+        ])
+        .toArray(),
+      // avg GOPEN closing percentile per branch (demand)
+      collections
+        .cutoffs()
+        .aggregate<{ _id: number; avgCutoff: number }>([
+          {
+            $match: {
+              year: YEAR,
+              categoryCode: "GOPEN",
+              verifiedAt: { $ne: null },
+            },
+          },
+          { $group: { _id: "$branchId", avgCutoff: { $avg: "$closingPercentile" } } },
+        ])
+        .toArray(),
+      collections.branches().find({}).toArray(),
+    ]);
+
+    const demandById = new Map(demand.map((d) => [d._id, d.avgCutoff]));
+    const branchById = new Map(branches.map((b) => [b._id, b]));
+
+    const rows: BranchListItem[] = offAgg
+      .filter((o) => o.colleges > 0 && branchById.has(o._id))
+      .map((o) => {
+        const b = branchById.get(o._id)!;
+        return {
+          id: o._id,
+          name: b.name,
+          slug: b.slug,
+          family: b.family,
+          colleges: o.colleges,
+          seats: o.seats,
+          avgCutoff: demandById.get(o._id) ?? null,
+        };
+      });
+
+    // order by seats desc, colleges desc, id (stable tiebreak)
+    rows.sort(
+      (a, b) =>
+        b.seats - a.seats || b.colleges - a.colleges || a.id - b.id
+    );
+    return rows;
   },
   ["list-branches"],
-  { revalidate: REVALIDATE },
+  { revalidate: REVALIDATE }
 );
 
 export interface BranchMatrix {
@@ -71,99 +101,143 @@ export interface BranchMatrix {
  * per (branch family, top city) admission demand (max GOPEN %ile) + seats, plus
  * each family's cached live job-market summary (mean salary + jobs) where present.
  */
-export const getBranchCityMatrix = unstable_cache(
+export const getBranchCityMatrix = cached(
   async (cityCount = 8): Promise<BranchMatrix> => {
-  const [cityRows, seatRows, demandRows, marketRows, slugRows] = await Promise.all([
-    db.execute(sql`
-      select c.city, coalesce(sum(cb.total_intake),0)::int as seats
-      from colleges c join college_branches cb on cb.college_id = c.id
-      where c.city is not null
-      group by c.city order by seats desc limit ${cityCount}
-    `),
-    db.execute(sql`
-      select b.family, c.city, coalesce(sum(cb.total_intake),0)::int as seats
-      from college_branches cb
-      join colleges c on c.id = cb.college_id
-      join branches b on b.id = cb.branch_id
-      where c.city is not null and b.family is not null
-      group by b.family, c.city
-    `),
-    db.execute(sql`
-      select b.family, c.city, max(cu.closing_percentile)::float as demand
-      from cutoffs cu
-      join college_branches cb on cb.id = cu.college_branch_id
-      join colleges c on c.id = cb.college_id
-      join branches b on b.id = cb.branch_id
-      join categories cat on cat.id = cu.category_id
-      where cu.year = ${YEAR} and cat.code = 'GOPEN' and cu.verified_at is not null
-        and c.city is not null and b.family is not null
-      group by b.family, c.city
-    `),
-    db.execute(sql`select family, payload from job_market where kind = 'summary'`),
-    db.execute(sql`
-      select distinct on (family) family, slug from (
-        select b.family, b.slug, count(cb.id) as n
-        from branches b join college_branches cb on cb.branch_id = b.id
-        where b.family is not null
-        group by b.family, b.slug, b.id
-      ) t order by family, n desc
-    `),
-  ]);
+    const [cityRows, seatRows, demandRows, marketRows, offByBranch, branches] =
+      await Promise.all([
+        collections
+          .offerings()
+          .aggregate<{ city: string; seats: number }>([
+            { $match: { city: { $ne: null } } },
+            {
+              $group: {
+                _id: "$city",
+                seats: { $sum: { $ifNull: ["$totalIntake", 0] } },
+              },
+            },
+            { $project: { _id: 0, city: "$_id", seats: 1 } },
+            { $sort: { seats: -1 } },
+            { $limit: cityCount },
+          ])
+          .toArray(),
+        collections
+          .offerings()
+          .aggregate<{ family: string; city: string; seats: number }>([
+            { $match: { city: { $ne: null }, family: { $ne: null } } },
+            {
+              $group: {
+                _id: { family: "$family", city: "$city" },
+                seats: { $sum: { $ifNull: ["$totalIntake", 0] } },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                family: "$_id.family",
+                city: "$_id.city",
+                seats: 1,
+              },
+            },
+          ])
+          .toArray(),
+        collections
+          .cutoffs()
+          .aggregate<{ family: string; city: string; demand: number }>([
+            {
+              $match: {
+                year: YEAR,
+                categoryCode: "GOPEN",
+                verifiedAt: { $ne: null },
+                city: { $ne: null },
+                family: { $ne: null },
+              },
+            },
+            {
+              $group: {
+                _id: { family: "$family", city: "$city" },
+                demand: { $max: "$closingPercentile" },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                family: "$_id.family",
+                city: "$_id.city",
+                demand: 1,
+              },
+            },
+          ])
+          .toArray(),
+        collections.jobMarket().find({ kind: "summary" }).toArray(),
+        // offering counts per branch (for the representative slug per family)
+        collections
+          .offerings()
+          .aggregate<{ _id: number; n: number }>([
+            { $group: { _id: "$branchId", n: { $sum: 1 } } },
+          ])
+          .toArray(),
+        collections.branches().find({}).toArray(),
+      ]);
 
-  const cities = (cityRows as unknown as { city: string }[]).map((r) => r.city);
-  const citySet = new Set(cities);
+    const cities = cityRows.map((r) => r.city);
+    const citySet = new Set(cities);
 
-  const cells: BranchMatrix["cells"] = {};
-  const familyTotals = new Map<string, number>();
-  for (const r of seatRows as unknown as { family: string; city: string; seats: number }[]) {
-    familyTotals.set(r.family, (familyTotals.get(r.family) ?? 0) + r.seats);
-    if (!citySet.has(r.city)) continue;
-    (cells[r.family] ??= {})[r.city] = { demand: null, seats: r.seats };
-  }
-  for (const r of demandRows as unknown as { family: string; city: string; demand: number | null }[]) {
-    if (!citySet.has(r.city)) continue;
-    const cell = (cells[r.family] ??= {})[r.city];
-    if (cell) cell.demand = r.demand;
-    else cells[r.family][r.city] = { demand: r.demand, seats: 0 };
-  }
+    const cells: BranchMatrix["cells"] = {};
+    const familyTotals = new Map<string, number>();
+    for (const r of seatRows) {
+      familyTotals.set(r.family, (familyTotals.get(r.family) ?? 0) + r.seats);
+      if (!citySet.has(r.city)) continue;
+      (cells[r.family] ??= {})[r.city] = { demand: null, seats: r.seats };
+    }
+    for (const r of demandRows) {
+      if (!citySet.has(r.city)) continue;
+      const cell = (cells[r.family] ??= {})[r.city];
+      if (cell) cell.demand = r.demand;
+      else cells[r.family][r.city] = { demand: r.demand, seats: 0 };
+    }
 
-  const market: BranchMatrix["market"] = {};
-  for (const r of marketRows as unknown as {
-    family: string;
-    payload: { meanSalary: number | null; jobs: number | null };
-  }[]) {
-    market[r.family] = { salary: r.payload?.meanSalary ?? null, jobs: r.payload?.jobs ?? null };
-  }
+    const market: BranchMatrix["market"] = {};
+    for (const r of marketRows) {
+      const payload = r.payload as { meanSalary?: number | null; jobs?: number | null };
+      market[r.family] = {
+        salary: payload?.meanSalary ?? null,
+        jobs: payload?.jobs ?? null,
+      };
+    }
 
-  const slugs: BranchMatrix["slugs"] = {};
-  for (const r of slugRows as unknown as { family: string; slug: string }[]) {
-    if (!slugs[r.family]) slugs[r.family] = r.slug;
-  }
+    // Representative branch slug per family = the branch with the most offerings.
+    const nByBranch = new Map(offByBranch.map((o) => [o._id, o.n]));
+    const bestPerFamily = new Map<string, { slug: string; n: number }>();
+    for (const b of branches) {
+      if (!b.family) continue;
+      const n = nByBranch.get(b._id) ?? 0;
+      const cur = bestPerFamily.get(b.family);
+      if (!cur || n > cur.n) bestPerFamily.set(b.family, { slug: b.slug, n });
+    }
+    const slugs: BranchMatrix["slugs"] = {};
+    for (const [family, { slug }] of bestPerFamily) slugs[family] = slug;
 
-  const families = [...familyTotals.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([f]) => f)
-    .filter((f) => cells[f]);
+    const families = [...familyTotals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([f]) => f)
+      .filter((f) => cells[f]);
 
-  return { families, cities, cells, market, slugs };
+    return { families, cities, cells, market, slugs };
   },
   ["branch-city-matrix"],
-  { revalidate: REVALIDATE },
+  { revalidate: REVALIDATE }
 );
 
 export async function getBranchBySlug(slug: string) {
-  const rows = await db.execute(sql`
-    select id, name, slug, degree, family
-    from branches where slug = ${slug} limit 1
-  `);
-  const list = rows as unknown as {
-    id: number;
-    name: string;
-    slug: string;
-    degree: string;
-    family: string | null;
-  }[];
-  return list[0] ?? null;
+  const b = await collections.branches().findOne({ slug });
+  if (!b) return null;
+  return {
+    id: b._id,
+    name: b.name,
+    slug: b.slug,
+    degree: b.degree,
+    family: b.family,
+  };
 }
 
 export interface BranchAnalysis {
@@ -191,83 +265,145 @@ export interface BranchAnalysis {
   trend: { year: number; avgCutoff: number | null }[];
 }
 
-export const getBranchAnalysis = unstable_cache(
+export const getBranchAnalysis = cached(
   async (branchId: number): Promise<BranchAnalysis> => {
-  const [overviewRows, byCityRows, topRows, trendRows] = await Promise.all([
-    db.execute(sql`
-      select
-        count(distinct cb.college_id)::int as colleges,
-        count(distinct c.city)::int as cities,
-        coalesce(sum(cb.total_intake), 0)::int as seats,
-        (select avg(cu.closing_percentile)::float from cutoffs cu
-           join categories cat on cat.id = cu.category_id
-          where cu.college_branch_id in (select id from college_branches where branch_id = ${branchId})
-            and cu.year = ${YEAR} and cat.code = 'GOPEN' and cu.verified_at is not null) as "avgCutoff",
-        (select max(cu.closing_percentile)::float from cutoffs cu
-           join categories cat on cat.id = cu.category_id
-          where cu.college_branch_id in (select id from college_branches where branch_id = ${branchId})
-            and cu.year = ${YEAR} and cat.code = 'GOPEN' and cu.verified_at is not null) as "topCutoff"
-      from college_branches cb
-      join colleges c on c.id = cb.college_id
-      where cb.branch_id = ${branchId}
-    `),
-    db.execute(sql`
-      select c.city,
-        count(distinct cb.college_id)::int as colleges,
-        coalesce(sum(cb.total_intake), 0)::int as seats,
-        avg(g.cp)::float as "avgCutoff",
-        max(g.cp)::float as "topCutoff"
-      from college_branches cb
-      join colleges c on c.id = cb.college_id
-      left join lateral (
-        select cu.closing_percentile as cp from cutoffs cu
-          join categories cat on cat.id = cu.category_id
-         where cu.college_branch_id = cb.id and cu.year = ${YEAR}
-           and cat.code = 'GOPEN' and cu.verified_at is not null
-         order by cu.closing_percentile desc limit 1
-      ) g on true
-      where cb.branch_id = ${branchId} and c.city is not null
-      group by c.city
-      order by seats desc
-    `),
-    db.execute(sql`
-      select c.name, c.slug, c.city, cb.total_intake as seats,
-        (select max(cu.closing_percentile)::float from cutoffs cu
-           join categories cat on cat.id = cu.category_id
-          where cu.college_branch_id = cb.id and cu.year = ${YEAR}
-            and cat.code = 'GOPEN' and cu.verified_at is not null) as cutoff
-      from college_branches cb
-      join colleges c on c.id = cb.college_id
-      where cb.branch_id = ${branchId}
-      order by cutoff desc nulls last, seats desc nulls last
-      limit 10
-    `),
-    db.execute(sql`
-      select cu.year,
-        avg(cu.closing_percentile)::float as "avgCutoff"
-      from cutoffs cu
-      join categories cat on cat.id = cu.category_id
-      where cu.college_branch_id in (select id from college_branches where branch_id = ${branchId})
-        and cat.code = 'GOPEN' and cu.verified_at is not null
-      group by cu.year order by cu.year
-    `),
-  ]);
+    const offerings = await collections
+      .offerings()
+      .find({ branchId })
+      .toArray();
+    const collegeIds = [...new Set(offerings.map((o) => o.collegeId))];
 
-  const overviewList = overviewRows as unknown as BranchAnalysis["overview"][];
-  return {
-    overview:
-      overviewList[0] ?? {
-        colleges: 0,
-        seats: 0,
-        avgCutoff: null,
-        topCutoff: null,
-        cities: 0,
-      },
-    byCity: byCityRows as unknown as BranchAnalysis["byCity"],
-    topColleges: topRows as unknown as BranchAnalysis["topColleges"],
-    trend: trendRows as unknown as BranchAnalysis["trend"],
-  };
+    const [ovAgg, perOff, trend, cols] = await Promise.all([
+      // overview: avg/max over ALL GOPEN 2025 cutoff rows for the branch
+      collections
+        .cutoffs()
+        .aggregate<{ avg: number | null; max: number | null }>([
+          {
+            $match: {
+              branchId,
+              year: YEAR,
+              categoryCode: "GOPEN",
+              verifiedAt: { $ne: null },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              avg: { $avg: "$closingPercentile" },
+              max: { $max: "$closingPercentile" },
+            },
+          },
+        ])
+        .toArray(),
+      // per-offering top GOPEN 2025 cutoff (mirrors the pg lateral)
+      collections
+        .cutoffs()
+        .aggregate<{ _id: number; maxCp: number }>([
+          {
+            $match: {
+              branchId,
+              year: YEAR,
+              categoryCode: "GOPEN",
+              verifiedAt: { $ne: null },
+            },
+          },
+          { $group: { _id: "$collegeBranchId", maxCp: { $max: "$closingPercentile" } } },
+        ])
+        .toArray(),
+      // trend: avg GOPEN closing percentile per year (all years)
+      collections
+        .cutoffs()
+        .aggregate<{ year: number; avgCutoff: number | null }>([
+          {
+            $match: {
+              branchId,
+              categoryCode: "GOPEN",
+              verifiedAt: { $ne: null },
+            },
+          },
+          { $group: { _id: "$year", avgCutoff: { $avg: "$closingPercentile" } } },
+          { $sort: { _id: 1 } },
+          { $project: { _id: 0, year: "$_id", avgCutoff: 1 } },
+        ])
+        .toArray(),
+      collections
+        .colleges()
+        .find(
+          { _id: { $in: collegeIds } },
+          { projection: { name: 1, slug: 1, city: 1 } }
+        )
+        .toArray(),
+    ]);
+
+    const maxCpByCb = new Map(perOff.map((p) => [p._id, p.maxCp]));
+    const collegeById = new Map(cols.map((c) => [c._id, c]));
+
+    // overview
+    const cities = new Set(
+      offerings.map((o) => o.city).filter((c): c is string => c != null)
+    );
+    const overview = {
+      colleges: offerings.length,
+      cities: cities.size,
+      seats: offerings.reduce((s, o) => s + (o.totalIntake ?? 0), 0),
+      avgCutoff: ovAgg[0]?.avg ?? null,
+      topCutoff: ovAgg[0]?.max ?? null,
+    };
+
+    // byCity
+    const byCityMap = new Map<
+      string,
+      { colleges: number; seats: number; cps: number[] }
+    >();
+    for (const o of offerings) {
+      if (o.city == null) continue;
+      const e =
+        byCityMap.get(o.city) ??
+        byCityMap.set(o.city, { colleges: 0, seats: 0, cps: [] }).get(o.city)!;
+      e.colleges += 1;
+      e.seats += o.totalIntake ?? 0;
+      const cp = maxCpByCb.get(o._id);
+      if (cp != null) e.cps.push(cp);
+    }
+    const byCity = [...byCityMap.entries()]
+      .map(([city, e]) => ({
+        city,
+        colleges: e.colleges,
+        seats: e.seats,
+        avgCutoff: e.cps.length
+          ? e.cps.reduce((s, x) => s + x, 0) / e.cps.length
+          : null,
+        topCutoff: e.cps.length ? Math.max(...e.cps) : null,
+      }))
+      .sort((a, b) => b.seats - a.seats || a.city.localeCompare(b.city));
+
+    // topColleges
+    const topColleges = offerings
+      .map((o) => {
+        const c = collegeById.get(o.collegeId);
+        return {
+          name: c?.name ?? o.collegeName,
+          slug: c?.slug ?? "",
+          city: c?.city ?? o.city,
+          seats: o.totalIntake,
+          cutoff: maxCpByCb.get(o._id) ?? null,
+          _id: o._id,
+        };
+      })
+      .sort((a, b) => {
+        if (a.cutoff != null || b.cutoff != null) {
+          if (a.cutoff == null) return 1;
+          if (b.cutoff == null) return -1;
+          if (b.cutoff !== a.cutoff) return b.cutoff - a.cutoff;
+        }
+        if ((a.seats ?? 0) !== (b.seats ?? 0)) return (b.seats ?? 0) - (a.seats ?? 0);
+        return a._id - b._id;
+      })
+      .slice(0, 10)
+      .map(({ name, slug, city, seats, cutoff }) => ({ name, slug, city, seats, cutoff }));
+
+    return { overview, byCity, topColleges, trend };
   },
   ["branch-analysis"],
-  { revalidate: REVALIDATE },
+  { revalidate: REVALIDATE }
 );

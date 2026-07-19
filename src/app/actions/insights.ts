@@ -1,8 +1,6 @@
 "use server";
 
-import { db } from "@/db";
-import { aiInsights } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { collections } from "@/db/collections";
 import { aiEnabled, AI_MODEL, generateInsights, type CollegeInsights } from "@/lib/ai";
 import {
   buildInsightFacts,
@@ -48,13 +46,13 @@ export async function generateCollegeInsights(
     return { ok: false, error: "Could not generate insights right now." };
   }
 
-  await db
-    .insert(aiInsights)
-    .values({ collegeId, model: AI_MODEL, dataHash: hash, content: insights })
-    .onConflictDoUpdate({
-      target: aiInsights.collegeId,
-      set: { model: AI_MODEL, dataHash: hash, content: insights, createdAt: new Date() },
-    });
+  await collections.aiInsights().updateOne(
+    { collegeId },
+    {
+      $set: { collegeId, model: AI_MODEL, dataHash: hash, content: insights, createdAt: new Date() },
+    },
+    { upsert: true }
+  );
 
   return { ok: true, insights, cached: false, model: AI_MODEL };
 }

@@ -1,7 +1,5 @@
 import "server-only";
-import { db } from "@/db";
-import { cityEmployers } from "@/db/schema";
-import { and, eq } from "drizzle-orm";
+import { collections } from "@/db/collections";
 import { adzunaEnabled } from "./adzuna";
 import { roleForFamily } from "./branch-roles";
 
@@ -75,11 +73,12 @@ export async function getCityEmployers(
   const scope = family ?? "all";
   const role = roleForFamily(family);
 
-  const [cached] = await db
-    .select({ payload: cityEmployers.payload, fetchedAt: cityEmployers.fetchedAt })
-    .from(cityEmployers)
-    .where(and(eq(cityEmployers.city, city), eq(cityEmployers.scope, scope)))
-    .limit(1);
+  const cached = await collections
+    .cityEmployers()
+    .findOne(
+      { city, scope },
+      { projection: { payload: 1, fetchedAt: 1 } }
+    );
 
   const cachedPayload = cached?.payload as
     | { employers: Employer[]; totalPostings: number; history: EmployerHistory[] }
@@ -104,13 +103,13 @@ export async function getCityEmployers(
       ].slice(0, 6);
 
       const payload = { employers, totalPostings, history };
-      await db
-        .insert(cityEmployers)
-        .values({ city, scope, payload, fetchedAt: new Date() })
-        .onConflictDoUpdate({
-          target: [cityEmployers.city, cityEmployers.scope],
-          set: { payload, fetchedAt: new Date() },
-        });
+      await collections
+        .cityEmployers()
+        .updateOne(
+          { city, scope },
+          { $set: { city, scope, payload, fetchedAt: new Date() } },
+          { upsert: true }
+        );
 
       return {
         city,
