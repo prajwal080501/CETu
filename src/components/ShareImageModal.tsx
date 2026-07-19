@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { X, Image as ImageIcon, FileText, Loader2 } from "lucide-react";
 
 /**
@@ -66,12 +67,13 @@ export function ShareImageModal({
     }
   }
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-[100] overflow-y-auto bg-black/60 backdrop-blur-sm"
       onClick={onClose}
     >
-      <div className="my-6 w-full max-w-3xl" onClick={(e) => e.stopPropagation()}>
+      <div className="flex min-h-full items-center justify-center p-4">
+      <div className="w-full max-w-3xl" onClick={(e) => e.stopPropagation()}>
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-medium text-white">Preview &amp; download</span>
           <div className="flex items-center gap-2">
@@ -124,6 +126,8 @@ export function ShareImageModal({
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </div>,
+    document.body
   );
 }

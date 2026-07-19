@@ -239,8 +239,9 @@ export default async function CollegePage({
         <section className="mt-10">
           <h2 className="text-lg font-semibold">Cutoff matrix</h2>
           <p className="mb-3 mt-1 text-sm text-muted-foreground">
-            Closing percentile for every category (rows) across branches
-            (columns). Switch seat type and filter branches.
+            Closing percentile and merit rank for every category (rows) across
+            branches (columns), in separate tables. Switch seat type and filter
+            branches.
           </p>
           <CutoffMatrix year={matrix.year} rows={matrix.rows} collegeName={college.name} />
         </section>

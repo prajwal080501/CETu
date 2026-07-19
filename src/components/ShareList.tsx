@@ -1,7 +1,8 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { X, Download, Image as ImageIcon, FileText, Loader2 } from "lucide-react";
+import { createPortal } from "react-dom";
+import { X, Image as ImageIcon, FileText, Loader2 } from "lucide-react";
 import type { FlatResult } from "./PredictorResults";
 import type { Chance } from "@/lib/predictor";
 
@@ -78,12 +79,13 @@ export function ShareList({
     }
   }
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-[100] overflow-y-auto bg-black/60 backdrop-blur-sm"
       onClick={onClose}
     >
-      <div className="my-6 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+      <div className="flex min-h-full items-center justify-center p-4">
+      <div className="w-full max-w-md" onClick={(e) => e.stopPropagation()}>
         {/* toolbar */}
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-medium text-white">Preview &amp; download</span>
@@ -198,6 +200,8 @@ export function ShareList({
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </div>,
+    document.body
   );
 }
