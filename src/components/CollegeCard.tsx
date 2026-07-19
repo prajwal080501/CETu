@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { ArrowRight } from "lucide-react";
+import { memo } from "react";
 import type { RankedCollege } from "@/lib/landing";
 import { CollegeLogo } from "@/components/Logo";
 import { Card } from "@/components/ui/card";
@@ -15,7 +16,7 @@ const TYPE_LABEL: Record<string, string> = {
 };
 
 /** College card with hover lift + a detail row that reveals on hover. */
-export function CollegeCard({
+function CollegeCardBase({
   college,
   rank,
 }: {
@@ -92,11 +93,20 @@ export function CollegeCard({
   );
 }
 
-function MiniStat({ value, label }: { value: string; label: string }) {
+export const CollegeCard = memo(CollegeCardBase, (prev, next) => {
+  // Only re-render if college data or rank changes
   return (
-    <div className="flex-1 rounded-lg bg-muted/60 px-3 py-2 text-center">
-      <div className="font-semibold tabular-nums">{value}</div>
-      <div className="text-[11px] text-muted-foreground">{label}</div>
-    </div>
+    prev.college.slug === next.college.slug &&
+    prev.college.name === next.college.name &&
+    prev.rank === next.rank
   );
-}
+});
+
+const MiniStatBase = ({ value, label }: { value: string; label: string }) => (
+  <div className="flex-1 rounded-lg bg-muted/60 px-3 py-2 text-center">
+    <div className="font-semibold tabular-nums">{value}</div>
+    <div className="text-[11px] text-muted-foreground">{label}</div>
+  </div>
+);
+
+const MiniStat = memo(MiniStatBase);
