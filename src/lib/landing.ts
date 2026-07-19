@@ -1,7 +1,18 @@
 import { db } from "@/db";
 import { sql } from "drizzle-orm";
+import { unstable_cache } from "next/cache";
 
 const PREDICT_YEAR = 2025;
+
+/**
+ * These landing/reference queries (aggregate counts, competitiveness ranking,
+ * the search index) only change when cutoffs/colleges are ingested — never
+ * per-request. On serverless + free-tier Postgres, running them live on every
+ * request is what made the homepage time out and crash. Wrap each in the data
+ * cache so the DB is hit at most once per REVALIDATE window; results are shared
+ * across all requests until they expire.
+ */
+const REVALIDATE = 3600; // 1 hour
 
 export interface RankedCollege {
   id: number;
@@ -25,10 +36,11 @@ export interface RankedCollege {
  * percentile in the latest year (higher = harder to get = "top"). Colleges with
  * no cutoff sort last. Powers the list page and the landing "top colleges".
  */
-export async function getRankedColleges(opts?: {
-  area?: string;
-  limit?: number;
-}): Promise<RankedCollege[]> {
+export const getRankedColleges = unstable_cache(
+  async (opts?: {
+    area?: string;
+    limit?: number;
+  }): Promise<RankedCollege[]> => {
   const areaClause = opts?.area
     ? sql`and c.city ilike ${opts.area}`
     : sql``;
@@ -60,7 +72,10 @@ export async function getRankedColleges(opts?: {
     ${limitClause}
   `);
   return rows as unknown as RankedCollege[];
-}
+  },
+  ["ranked-colleges"],
+  { revalidate: REVALIDATE },
+);
 
 export interface SearchDoc {
   name: string;
@@ -74,7 +89,8 @@ export interface SearchDoc {
  * ordered by competitiveness so equal-relevance ties surface the top college
  * first. Small enough (~389 rows) to filter instantly in the browser.
  */
-export async function getSearchIndex(): Promise<SearchDoc[]> {
+export const getSearchIndex = unstable_cache(
+  async (): Promise<SearchDoc[]> => {
   const rows = await db.execute(sql`
     select c.name, c.slug, c.city, u.name as university
     from colleges c
@@ -89,51 +105,67 @@ export async function getSearchIndex(): Promise<SearchDoc[]> {
       c.name
   `);
   return rows as unknown as SearchDoc[];
-}
+  },
+  ["search-index"],
+  { revalidate: REVALIDATE },
+);
 
 /** Headline totals for the landing hero. */
-export async function getLandingStats() {
-  const rows = await db.execute(sql`
-    select
-      (select count(*) from colleges where not hidden)::int as colleges,
-      (select count(*) from branches)::int as branches,
-      (select coalesce(sum(total_intake),0) from college_branches)::int as seats,
-      (select count(*) from cutoffs)::int as cutoffs,
-      (select count(distinct year) from cutoffs)::int as years
-  `);
-  return (rows as unknown as {
-    colleges: number;
-    branches: number;
-    seats: number;
-    cutoffs: number;
-    years: number;
-  }[])[0];
-}
+export const getLandingStats = unstable_cache(
+  async () => {
+    const rows = await db.execute(sql`
+      select
+        (select count(*) from colleges where not hidden)::int as colleges,
+        (select count(*) from branches)::int as branches,
+        (select coalesce(sum(total_intake),0) from college_branches)::int as seats,
+        (select count(*) from cutoffs)::int as cutoffs,
+        (select count(distinct year) from cutoffs)::int as years
+    `);
+    return (rows as unknown as {
+      colleges: number;
+      branches: number;
+      seats: number;
+      cutoffs: number;
+      years: number;
+    }[])[0];
+  },
+  ["landing-stats"],
+  { revalidate: REVALIDATE },
+);
 
 /** Seats grouped by branch family (for a bar chart). */
-export async function getSeatsByFamily() {
-  const rows = await db.execute(sql`
-    select coalesce(b.family, 'Other') as family,
-           coalesce(sum(cb.total_intake), 0)::int as seats
-    from college_branches cb join branches b on b.id = cb.branch_id
-    group by b.family order by seats desc
-  `);
-  return rows as unknown as { family: string; seats: number }[];
-}
+export const getSeatsByFamily = unstable_cache(
+  async () => {
+    const rows = await db.execute(sql`
+      select coalesce(b.family, 'Other') as family,
+             coalesce(sum(cb.total_intake), 0)::int as seats
+      from college_branches cb join branches b on b.id = cb.branch_id
+      group by b.family order by seats desc
+    `);
+    return rows as unknown as { family: string; seats: number }[];
+  },
+  ["seats-by-family"],
+  { revalidate: REVALIDATE },
+);
 
 /** Colleges + seats grouped by home university region (for a bar chart). */
-export async function getCollegesByRegion() {
-  const rows = await db.execute(sql`
-    select coalesce(u.short_name, u.name, 'Unmapped') as region,
-           count(distinct c.id)::int as colleges
-    from colleges c left join universities u on u.id = c.home_university_id
-    group by u.short_name, u.name order by colleges desc limit 10
-  `);
-  return rows as unknown as { region: string; colleges: number }[];
-}
+export const getCollegesByRegion = unstable_cache(
+  async () => {
+    const rows = await db.execute(sql`
+      select coalesce(u.short_name, u.name, 'Unmapped') as region,
+             count(distinct c.id)::int as colleges
+      from colleges c left join universities u on u.id = c.home_university_id
+      group by u.short_name, u.name order by colleges desc limit 10
+    `);
+    return rows as unknown as { region: string; colleges: number }[];
+  },
+  ["colleges-by-region"],
+  { revalidate: REVALIDATE },
+);
 
 /** Colleges with the highest verified placement packages (for a home widget). */
-export async function getTopPlacements(limit = 6) {
+export const getTopPlacements = unstable_cache(
+  async (limit = 6) => {
   const rows = await db.execute(sql`
     select c.name, c.slug, c.city,
            max(p.highest_package_lpa)::float as highest,
@@ -153,14 +185,21 @@ export async function getTopPlacements(limit = 6) {
     median: number | null;
     avg: number | null;
   }[];
-}
+  },
+  ["top-placements"],
+  { revalidate: REVALIDATE },
+);
 
 /** Top areas (cities) by number of colleges — for the area browser. */
-export async function getAreaFacets(limit = 12) {
-  const rows = await db.execute(sql`
-    select city, count(*)::int as colleges
-    from colleges where city is not null and not hidden
-    group by city order by colleges desc limit ${limit}
-  `);
-  return rows as unknown as { city: string; colleges: number }[];
-}
+export const getAreaFacets = unstable_cache(
+  async (limit = 12) => {
+    const rows = await db.execute(sql`
+      select city, count(*)::int as colleges
+      from colleges where city is not null and not hidden
+      group by city order by colleges desc limit ${limit}
+    `);
+    return rows as unknown as { city: string; colleges: number }[];
+  },
+  ["area-facets"],
+  { revalidate: REVALIDATE },
+);

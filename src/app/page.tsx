@@ -18,8 +18,11 @@ import { Badge } from "@/components/ui/badge";
 export const dynamic = "force-dynamic";
 
 export default async function Home() {
-  const [stats, seatsByFamily, areas, topColleges, topPlacements, searchIndex] =
-    await Promise.all([
+  // Each landing query is cached (see src/lib/landing.ts); allSettled means a
+  // single slow/failed query degrades only its own widget instead of crashing
+  // the whole page render.
+  const [statsR, seatsR, areasR, collegesR, placementsR, indexR] =
+    await Promise.allSettled([
       getLandingStats(),
       getSeatsByFamily(),
       getAreaFacets(8),
@@ -28,13 +31,23 @@ export default async function Home() {
       getSearchIndex(),
     ]);
 
-  const statTiles = [
-    { label: "Colleges", value: stats.colleges.toLocaleString() },
-    { label: "Seats", value: stats.seats.toLocaleString() },
-    { label: "Branches", value: stats.branches.toLocaleString() },
-    { label: "Cutoff records", value: stats.cutoffs.toLocaleString() },
-    { label: "Years of data", value: String(stats.years) },
-  ];
+  const stats = statsR.status === "fulfilled" ? statsR.value : null;
+  const seatsByFamily = seatsR.status === "fulfilled" ? seatsR.value : [];
+  const areas = areasR.status === "fulfilled" ? areasR.value : [];
+  const topColleges = collegesR.status === "fulfilled" ? collegesR.value : [];
+  const topPlacements =
+    placementsR.status === "fulfilled" ? placementsR.value : [];
+  const searchIndex = indexR.status === "fulfilled" ? indexR.value : [];
+
+  const statTiles = stats
+    ? [
+        { label: "Colleges", value: stats.colleges.toLocaleString() },
+        { label: "Seats", value: stats.seats.toLocaleString() },
+        { label: "Branches", value: stats.branches.toLocaleString() },
+        { label: "Cutoff records", value: stats.cutoffs.toLocaleString() },
+        { label: "Years of data", value: String(stats.years) },
+      ]
+    : [];
 
   return (
     <div className="relative">
@@ -52,7 +65,7 @@ export default async function Home() {
         <section className="pt-16 pb-10 sm:pt-24">
           <Badge variant="secondary" className="mb-4 rounded-full">
             <TrendingUp className="mr-1 h-3 w-3" />
-            {stats.years} years of MHT-CET CAP data
+            {stats ? `${stats.years} years of MHT-CET CAP data` : "MHT-CET CAP data"}
           </Badge>
           <h1 className="max-w-3xl text-4xl font-bold tracking-tight sm:text-5xl md:text-6xl">
             Every Maharashtra engineering college,{" "}
@@ -62,7 +75,7 @@ export default async function Home() {
             in one place.
           </h1>
           <p className="mt-5 max-w-2xl text-lg text-muted-foreground">
-            Search colleges by area, compare {stats.years} years of CAP cutoffs,
+            Search colleges by area, compare {stats ? `${stats.years} years` : "multiple years"} of CAP cutoffs,
             see branch-wise seats — and predict where your percentile can get you.
           </p>
 
@@ -90,7 +103,7 @@ export default async function Home() {
         </section>
 
         {/* Stat tiles */}
-        <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 empty:hidden">
           {statTiles.map((s) => (
             <Card key={s.label} className="border-border/60">
               <CardContent className="px-5">
@@ -208,7 +221,7 @@ export default async function Home() {
               href="/colleges"
               className="text-sm font-medium text-primary hover:underline"
             >
-              View all {stats.colleges} →
+              View all{stats ? ` ${stats.colleges}` : ""} →
             </Link>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">

@@ -37,9 +37,16 @@ local machine and need attention first. Read **Known constraints** before you st
    ```
    (The dump includes schema + all data — no separate `drizzle-kit push` needed.)
 
-The DB client (`src/db/index.ts`) already switches to serverless-safe pooling
-(`max: 1`, `prepare: false`) when `VERCEL=1` or `NODE_ENV=production`, which the
-Neon transaction pooler requires.
+The DB client (`src/db/index.ts`) uses `max: 10` and disables prepared statements
+(`prepare: false`) in production, which the hosted transaction pooler requires.
+
+**Use a session pooler / port 5432 connection string, not the transaction pooler
+(port 6543).** On free-tier compute the transaction pooler cancelled the landing
+aggregate queries (`57014 canceling statement due to statement timeout`). The
+Supabase **session pooler** (`aws-1-<region>.pooler.supabase.com:5432`) or Neon's
+pooled string runs them reliably. The landing/reference queries are also cached
+for 1 h (`src/lib/landing.ts`) and the homepage degrades gracefully if any single
+query still times out, so a slow DB can no longer crash the page.
 
 ---
 
