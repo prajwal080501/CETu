@@ -126,9 +126,14 @@
   }
   body {
     @apply bg-background text-foreground;
+    /* Prevent accidental horizontal scroll into blank space from decorative
+       blur/transform overflow, calc(100vw-…) widths, etc. `clip` (not `hidden`)
+       avoids creating a scroll container, so the sticky header still works. */
+    overflow-x: clip;
   }
   html {
     @apply font-sans;
+    overflow-x: clip;
   }
 }
 /* Ambient / parallax animation keyframes (used by premium screens & widgets) */

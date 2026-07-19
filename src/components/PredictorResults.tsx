@@ -36,6 +36,8 @@ const CHANCE_LABEL: Record<Chance, string> = {
   moderate: "Target",
   reach: "Dream",
 };
+// Display order: safest (most reachable) first, then Target, then Dream.
+const CHANCE_ORDER: Chance[] = ["safe", "moderate", "reach"];
 
 const RING_COLOR: Record<Chance, string> = {
   safe: "var(--chart-3)", // teal/green
@@ -152,17 +154,52 @@ export function PredictorResults({
     });
   const clear = () => setList([]);
 
+  // Within each bucket, show the "top" (highest admission probability) first.
+  const byProb = (a: FlatResult, b: FlatResult) => b.probability - a.probability;
   const buckets: Record<Chance, FlatResult[]> = {
-    safe: results.filter((r) => r.chance === "safe"),
-    moderate: results.filter((r) => r.chance === "moderate"),
-    reach: results.filter((r) => r.chance === "reach"),
+    safe: results.filter((r) => r.chance === "safe").sort(byProb),
+    moderate: results.filter((r) => r.chance === "moderate").sort(byProb),
+    reach: results.filter((r) => r.chance === "reach").sort(byProb),
   };
+
+  const [visibleChances, setVisibleChances] = useState<Set<Chance>>(
+    () => new Set(CHANCE_ORDER)
+  );
+  const toggleChance = (c: Chance) =>
+    setVisibleChances((prev) => {
+      const next = new Set(prev);
+      if (next.has(c)) next.delete(c);
+      else next.add(c);
+      return next;
+    });
 
   return (
     <div className="mt-8 grid gap-8 lg:grid-cols-[1fr_20rem]">
       {/* results */}
       <div>
-        {(["reach", "moderate", "safe"] as Chance[]).map((chance) => (
+        {/* Dream / Target / Safe filters */}
+        <div className="mb-5 flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground">Show</span>
+          {CHANCE_ORDER.map((c) => {
+            const on = visibleChances.has(c);
+            return (
+              <button
+                key={c}
+                type="button"
+                onClick={() => toggleChance(c)}
+                aria-pressed={on}
+                className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                  on ? CHANCE_STYLE[c] : "border-border text-muted-foreground hover:bg-accent"
+                }`}
+              >
+                {CHANCE_LABEL[c]}
+                <span className="tabular-nums opacity-70">{buckets[c].length}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {CHANCE_ORDER.filter((c) => visibleChances.has(c)).map((chance) => (
           <section key={chance} className="mb-8">
             <h2 className="mb-3 flex items-center gap-2 text-lg font-semibold">
               <span
@@ -219,6 +256,11 @@ export function PredictorResults({
             )}
           </section>
         ))}
+        {visibleChances.size === 0 && (
+          <p className="text-sm text-muted-foreground">
+            Select a filter above to see options.
+          </p>
+        )}
       </div>
 
       {/* preference list panel */}

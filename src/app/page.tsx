@@ -12,6 +12,7 @@ import { BarStat } from "@/components/charts/bar-stat";
 import { CollegeCard } from "@/components/CollegeCard";
 import { CollegeSearch } from "@/components/CollegeSearch";
 import { QuickPredict } from "@/components/QuickPredict";
+import { AdmissionCountdown } from "@/components/AdmissionCountdown";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -102,8 +103,11 @@ export default async function Home() {
           </div>
         </section>
 
+        {/* Live MHT-CET admission countdown */}
+        <AdmissionCountdown />
+
         {/* Stat tiles */}
-        <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 empty:hidden">
+        <section className="mt-8 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 empty:hidden">
           {statTiles.map((s) => (
             <Card key={s.label} className="border-border/60">
               <CardContent className="px-5">

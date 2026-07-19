@@ -1,4 +1,5 @@
-import { Sparkles } from "lucide-react";
+import { Suspense } from "react";
+import { Sparkles, Loader2 } from "lucide-react";
 import {
   getPredictorMeta,
   loadCutoffHistory,
@@ -23,46 +24,68 @@ export const metadata = {
     "Enter your MHT-CET percentile and build your personalised college list — Dream, Target and Safe options by seat type — then share it as a branded image or PDF.",
 };
 
-// Latest year with verified closing cutoffs; we project to the next year.
 const PREDICT_YEAR = 2025;
 const TARGET_YEAR = 2026;
 
-export default async function MakeMyListPage({
-  searchParams,
+/** Skeleton shown while the prediction (65k-row history + trend) is computed. */
+function ResultsLoader() {
+  return (
+    <div className="mt-8">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        Building your list from {PREDICT_YEAR} CAP cutoffs…
+      </div>
+      <div className="mt-6 grid gap-8 lg:grid-cols-[1fr_20rem]">
+        <div className="space-y-6">
+          {[0, 1, 2].map((s) => (
+            <div key={s}>
+              <div className="mb-3 h-5 w-24 animate-pulse rounded bg-muted" />
+              <div className="space-y-2">
+                {[0, 1, 2].map((r) => (
+                  <div key={r} className="flex items-center gap-3 rounded-lg border border-border/50 p-3">
+                    <div className="h-11 w-11 shrink-0 animate-pulse rounded-full bg-muted" />
+                    <div className="flex-1 space-y-1.5">
+                      <div className="h-3.5 w-2/3 animate-pulse rounded bg-muted" />
+                      <div className="h-3 w-1/2 animate-pulse rounded bg-muted" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="h-52 animate-pulse rounded-xl border border-border/50 bg-muted/40" />
+      </div>
+    </div>
+  );
+}
+
+/** Heavy async part: awaits the cutoff history, predicts, and renders results. */
+async function Results({
+  percentile,
+  categoryCode,
+  universityId,
+  city,
 }: {
-  searchParams: Promise<{
-    percentile?: string;
-    category?: string;
-    university?: string;
-    city?: string;
-  }>;
+  percentile: number;
+  categoryCode: string;
+  universityId: number;
+  city: string;
 }) {
-  const sp = await searchParams;
-  const [{ categories, universities, offeringInfo }, cities] = await Promise.all([
+  const [{ offeringInfo }, history] = await Promise.all([
     getPredictorMeta(),
-    getPredictorCities(),
+    loadCutoffHistory(),
   ]);
 
-  const percentile = sp.percentile ? Number(sp.percentile) : NaN;
-  const categoryCode = sp.category ?? "GOPEN";
-  const universityId = sp.university ? Number(sp.university) : NaN;
-  const city = sp.city?.trim() || "";
-  const hasInput =
-    !Number.isNaN(percentile) && percentile > 0 && percentile <= 100;
-
-  let results: ReturnType<typeof predictWithTrend> = [];
-  if (hasInput) {
-    const history = await loadCutoffHistory();
-    results = predictWithTrend(
-      {
-        percentile,
-        categoryCode,
-        homeUniversityId: Number.isNaN(universityId) ? null : universityId,
-      },
-      history,
-      TARGET_YEAR
-    );
-  }
+  const results = predictWithTrend(
+    {
+      percentile,
+      categoryCode,
+      homeUniversityId: Number.isNaN(universityId) ? null : universityId,
+    },
+    history,
+    TARGET_YEAR
+  );
 
   const flat: FlatResult[] = results.flatMap((r) => {
     const info = offeringInfo.get(r.collegeBranchId);
@@ -83,6 +106,53 @@ export default async function MakeMyListPage({
       },
     ];
   });
+
+  if (flat.length === 0) {
+    return (
+      <p className="mt-8 text-muted-foreground">
+        No matching colleges for {categoryCode}
+        {city ? ` in ${city}` : ""} ({PREDICT_YEAR}).{" "}
+        {city
+          ? "Try “Any location” or a different category."
+          : "Try the Open category or a different university."}
+      </p>
+    );
+  }
+
+  return (
+    <PredictorResults
+      results={flat}
+      year={PREDICT_YEAR}
+      percentile={percentile}
+      category={categoryCode}
+      initialList={clerkEnabled ? await loadPreferenceList() : undefined}
+      onPersist={clerkEnabled ? savePreferenceList : undefined}
+    />
+  );
+}
+
+export default async function MakeMyListPage({
+  searchParams,
+}: {
+  searchParams: Promise<{
+    percentile?: string;
+    category?: string;
+    university?: string;
+    city?: string;
+  }>;
+}) {
+  const sp = await searchParams;
+  const [{ categories, universities }, cities] = await Promise.all([
+    getPredictorMeta(),
+    getPredictorCities(),
+  ]);
+
+  const percentile = sp.percentile ? Number(sp.percentile) : NaN;
+  const categoryCode = sp.category ?? "GOPEN";
+  const universityId = sp.university ? Number(sp.university) : NaN;
+  const city = sp.city?.trim() || "";
+  const hasInput = !Number.isNaN(percentile) && percentile > 0 && percentile <= 100;
+  const key = `${percentile}|${categoryCode}|${universityId}|${city}`;
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-10">
@@ -105,9 +175,9 @@ export default async function MakeMyListPage({
         </h1>
         <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
           Enter your percentile and build your personalised list — sorted into{" "}
-          <strong className="text-foreground">Dream</strong>,{" "}
+          <strong className="text-foreground">Safe</strong>,{" "}
           <strong className="text-foreground">Target</strong> and{" "}
-          <strong className="text-foreground">Safe</strong> options from{" "}
+          <strong className="text-foreground">Dream</strong> options from{" "}
           {PREDICT_YEAR} CAP cutoffs. Order it, then share it as a branded image
           or PDF.
         </p>
@@ -115,11 +185,7 @@ export default async function MakeMyListPage({
 
       <div className="mt-6">
         <PredictorForm
-          categories={categories.map((c) => ({
-            id: c.id,
-            code: c.code,
-            label: c.label,
-          }))}
+          categories={categories.map((c) => ({ id: c.id, code: c.code, label: c.label }))}
           universities={universities}
           cities={cities.map((c) => ({ city: c.city as string, n: c.n }))}
           defaults={{
@@ -131,25 +197,16 @@ export default async function MakeMyListPage({
         />
       </div>
 
-      {hasInput &&
-        (flat.length === 0 ? (
-          <p className="mt-8 text-muted-foreground">
-            No matching colleges for {categoryCode}
-            {city ? ` in ${city}` : ""} ({PREDICT_YEAR}).{" "}
-            {city
-              ? "Try “Any location” or a different category."
-              : "Try the Open category or a different university."}
-          </p>
-        ) : (
-          <PredictorResults
-            results={flat}
-            year={PREDICT_YEAR}
+      {hasInput && (
+        <Suspense key={key} fallback={<ResultsLoader />}>
+          <Results
             percentile={percentile}
-            category={categoryCode}
-            initialList={clerkEnabled ? await loadPreferenceList() : undefined}
-            onPersist={clerkEnabled ? savePreferenceList : undefined}
+            categoryCode={categoryCode}
+            universityId={universityId}
+            city={city}
           />
-        ))}
+        </Suspense>
+      )}
     </div>
   );
 }
