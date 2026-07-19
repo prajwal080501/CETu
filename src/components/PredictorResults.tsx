@@ -36,13 +36,13 @@ const CHANCE_LABEL: Record<Chance, string> = {
   moderate: "Target",
   reach: "Dream",
 };
-// Display order: safest (most reachable) first, then Target, then Dream.
-const CHANCE_ORDER: Chance[] = ["safe", "moderate", "reach"];
+// Display order: Target (your realistic best-fit) first, then Safe, then Dream.
+const CHANCE_ORDER: Chance[] = ["moderate", "safe", "reach"];
 
-const RING_COLOR: Record<Chance, string> = {
-  safe: "var(--chart-3)", // teal/green
-  moderate: "var(--chart-4)", // amber
-  reach: "var(--chart-5)", // rose
+const CHANCE_DOT: Record<Chance, string> = {
+  safe: "bg-green-500",
+  moderate: "bg-yellow-500",
+  reach: "bg-rose-500",
 };
 
 /** Trend signal (context only): rising cutoff = getting harder over 2021–2025. */
@@ -61,33 +61,6 @@ function TrendArrow({
     >
       {rising ? "↑ trending harder" : "↓ easing"}
     </span>
-  );
-}
-
-/** Small circular gauge showing estimated admission probability. */
-function ProbabilityRing({ value, chance }: { value: number; chance: Chance }) {
-  const r = 15;
-  const c = 2 * Math.PI * r;
-  return (
-    <div className="relative h-11 w-11 shrink-0" title="Estimated admission probability">
-      <svg viewBox="0 0 36 36" className="h-11 w-11 -rotate-90">
-        <circle cx="18" cy="18" r={r} fill="none" strokeWidth="3.5" className="stroke-muted" />
-        <circle
-          cx="18"
-          cy="18"
-          r={r}
-          fill="none"
-          strokeWidth="3.5"
-          strokeLinecap="round"
-          stroke={RING_COLOR[chance]}
-          strokeDasharray={c}
-          strokeDashoffset={c * (1 - value / 100)}
-        />
-      </svg>
-      <span className="absolute inset-0 grid place-items-center text-[11px] font-semibold tabular-nums">
-        {value}%
-      </span>
-    </div>
   );
 }
 
@@ -178,11 +151,9 @@ export function PredictorResults({
     });
 
   return (
-    <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1fr)_20rem]">
-      {/* results */}
-      <div className="min-w-0">
-        {/* Dream / Target / Safe filters */}
-        <div className="mb-5 flex flex-wrap items-center gap-2">
+    <>
+      {/* Filters — tier, location & branch. Apply to everything below. */}
+      <div className="mt-8 flex flex-wrap items-center gap-2 rounded-xl border border-border/60 bg-card/60 p-3">
           <span className="text-xs font-medium text-muted-foreground">Show</span>
           {CHANCE_ORDER.map((c) => {
             const on = visibleChances.has(c);
@@ -201,8 +172,12 @@ export function PredictorResults({
               </button>
             );
           })}
-        </div>
+      </div>
 
+      {/* Results + preference sidebar */}
+      <div className="mt-6 grid gap-8 lg:grid-cols-[minmax(0,1fr)_20rem]">
+        {/* results */}
+        <div className="min-w-0">
         {CHANCE_ORDER.filter((c) => visibleChances.has(c)).map((chance) => (
           <section key={chance} className="mb-8">
             <h2 className="mb-3 flex items-center gap-2 text-lg font-semibold">
@@ -226,7 +201,10 @@ export function PredictorResults({
                     className="flex items-center justify-between gap-3 py-3"
                   >
                     <div className="flex min-w-0 items-center gap-3">
-                      <ProbabilityRing value={r.probability} chance={r.chance} />
+                      <span
+                        className={`mt-1 h-2.5 w-2.5 shrink-0 self-start rounded-full ${CHANCE_DOT[r.chance]}`}
+                        title={CHANCE_LABEL[r.chance]}
+                      />
                       <div className="min-w-0">
                         <a
                           href={`/colleges/${r.collegeSlug}`}
@@ -277,7 +255,8 @@ export function PredictorResults({
         onMove={move}
         onClear={clear}
       />
-    </div>
+      </div>
+    </>
   );
 }
 

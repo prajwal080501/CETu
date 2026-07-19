@@ -65,12 +65,14 @@ async function Results({
   percentile,
   categoryCode,
   universityId,
-  city,
+  loc,
+  br,
 }: {
   percentile: number;
   categoryCode: string;
   universityId: number;
-  city: string;
+  loc: string;
+  br: string;
 }) {
   const [{ offeringInfo }, history] = await Promise.all([
     getPredictorMeta(),
@@ -87,10 +89,14 @@ async function Results({
     TARGET_YEAR
   );
 
+  const locSet = new Set(loc ? loc.split(",").filter(Boolean) : []);
+  const brSet = new Set(br ? br.split(",").filter(Boolean) : []);
+
   const flat: FlatResult[] = results.flatMap((r) => {
     const info = offeringInfo.get(r.collegeBranchId);
     if (!info) return [];
-    if (city && (info.city ?? "").toLowerCase() !== city.toLowerCase()) return [];
+    if (locSet.size && !(info.city && locSet.has(info.city))) return [];
+    if (brSet.size && !brSet.has(info.branchName)) return [];
     return [
       {
         collegeBranchId: r.collegeBranchId,
@@ -110,11 +116,9 @@ async function Results({
   if (flat.length === 0) {
     return (
       <p className="mt-8 text-muted-foreground">
-        No matching colleges for {categoryCode}
-        {city ? ` in ${city}` : ""} ({PREDICT_YEAR}).{" "}
-        {city
-          ? "Try “Any location” or a different category."
-          : "Try the Open category or a different university."}
+        No matching colleges for {categoryCode} ({PREDICT_YEAR})
+        {loc || br ? " with those location/branch filters" : ""}. Try widening
+        your filters, the Open category, or a different home university.
       </p>
     );
   }
@@ -138,21 +142,27 @@ export default async function MakeMyListPage({
     percentile?: string;
     category?: string;
     university?: string;
-    city?: string;
+    loc?: string;
+    br?: string;
   }>;
 }) {
   const sp = await searchParams;
-  const [{ categories, universities }, cities] = await Promise.all([
+  const [{ categories, universities, offeringInfo }, cityRows] = await Promise.all([
     getPredictorMeta(),
     getPredictorCities(),
   ]);
+  const cities = cityRows.map((c) => c.city as string);
+  const branches = [
+    ...new Set([...offeringInfo.values()].map((o) => o.branchName)),
+  ].sort();
 
   const percentile = sp.percentile ? Number(sp.percentile) : NaN;
   const categoryCode = sp.category ?? "GOPEN";
   const universityId = sp.university ? Number(sp.university) : NaN;
-  const city = sp.city?.trim() || "";
+  const loc = sp.loc ?? "";
+  const br = sp.br ?? "";
   const hasInput = !Number.isNaN(percentile) && percentile > 0 && percentile <= 100;
-  const key = `${percentile}|${categoryCode}|${universityId}|${city}`;
+  const key = `${percentile}|${categoryCode}|${universityId}|${loc}|${br}`;
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-10">
@@ -187,12 +197,14 @@ export default async function MakeMyListPage({
         <PredictorForm
           categories={categories.map((c) => ({ id: c.id, code: c.code, label: c.label }))}
           universities={universities}
-          cities={cities.map((c) => ({ city: c.city as string, n: c.n }))}
+          cities={cities}
+          branches={branches}
           defaults={{
             percentile: sp.percentile,
             category: categoryCode,
             university: sp.university,
-            city,
+            loc,
+            br,
           }}
         />
       </div>
@@ -203,7 +215,8 @@ export default async function MakeMyListPage({
             percentile={percentile}
             categoryCode={categoryCode}
             universityId={universityId}
-            city={city}
+            loc={loc}
+            br={br}
           />
         </Suspense>
       )}
