@@ -1,5 +1,10 @@
 import { db } from "@/db";
 import { sql } from "drizzle-orm";
+import { unstable_cache } from "next/cache";
+
+// Branch analytics are derived from verified CAP data that only changes on
+// ingestion — cache them so every page view doesn't re-scan the cutoffs table.
+const REVALIDATE = 3600; // 1 hour
 
 /**
  * "Know Your Branch" analytics — all derived from our own verified CAP data, so
@@ -22,25 +27,36 @@ export interface BranchListItem {
 }
 
 /** All branches that have at least one offering, with headline stats. */
-export async function listBranches(): Promise<BranchListItem[]> {
-  const rows = await db.execute(sql`
-    select b.id, b.name, b.slug, b.family,
-      count(distinct cb.college_id)::int as colleges,
-      coalesce(sum(cb.total_intake), 0)::int as seats,
-      (select avg(cu.closing_percentile)::float
-         from cutoffs cu join categories cat on cat.id = cu.category_id
-        where cu.college_branch_id in (
-                select id from college_branches where branch_id = b.id)
-          and cu.year = ${YEAR} and cat.code = 'GOPEN'
-          and cu.verified_at is not null) as "avgCutoff"
-    from branches b
-    join college_branches cb on cb.branch_id = b.id
-    group by b.id, b.name, b.slug, b.family
-    having count(distinct cb.college_id) > 0
-    order by seats desc, colleges desc
-  `);
-  return rows as unknown as BranchListItem[];
-}
+export const listBranches = unstable_cache(
+  async (): Promise<BranchListItem[]> => {
+    // Compute each branch's avg GOPEN closing percentile once (grouped scan)
+    // instead of a correlated subquery per branch, then join it on.
+    const rows = await db.execute(sql`
+      with demand as (
+        select cb.branch_id, avg(cu.closing_percentile)::float as avg_cutoff
+        from cutoffs cu
+        join college_branches cb on cb.id = cu.college_branch_id
+        join categories cat on cat.id = cu.category_id
+        where cu.year = ${YEAR} and cat.code = 'GOPEN'
+          and cu.verified_at is not null
+        group by cb.branch_id
+      )
+      select b.id, b.name, b.slug, b.family,
+        count(distinct cb.college_id)::int as colleges,
+        coalesce(sum(cb.total_intake), 0)::int as seats,
+        d.avg_cutoff as "avgCutoff"
+      from branches b
+      join college_branches cb on cb.branch_id = b.id
+      left join demand d on d.branch_id = b.id
+      group by b.id, b.name, b.slug, b.family, d.avg_cutoff
+      having count(distinct cb.college_id) > 0
+      order by seats desc, colleges desc
+    `);
+    return rows as unknown as BranchListItem[];
+  },
+  ["list-branches"],
+  { revalidate: REVALIDATE },
+);
 
 export interface BranchMatrix {
   families: string[];
@@ -55,7 +71,8 @@ export interface BranchMatrix {
  * per (branch family, top city) admission demand (max GOPEN %ile) + seats, plus
  * each family's cached live job-market summary (mean salary + jobs) where present.
  */
-export async function getBranchCityMatrix(cityCount = 8): Promise<BranchMatrix> {
+export const getBranchCityMatrix = unstable_cache(
+  async (cityCount = 8): Promise<BranchMatrix> => {
   const [cityRows, seatRows, demandRows, marketRows, slugRows] = await Promise.all([
     db.execute(sql`
       select c.city, coalesce(sum(cb.total_intake),0)::int as seats
@@ -129,7 +146,10 @@ export async function getBranchCityMatrix(cityCount = 8): Promise<BranchMatrix> 
     .filter((f) => cells[f]);
 
   return { families, cities, cells, market, slugs };
-}
+  },
+  ["branch-city-matrix"],
+  { revalidate: REVALIDATE },
+);
 
 export async function getBranchBySlug(slug: string) {
   const rows = await db.execute(sql`
@@ -171,7 +191,8 @@ export interface BranchAnalysis {
   trend: { year: number; avgCutoff: number | null }[];
 }
 
-export async function getBranchAnalysis(branchId: number): Promise<BranchAnalysis> {
+export const getBranchAnalysis = unstable_cache(
+  async (branchId: number): Promise<BranchAnalysis> => {
   const [overviewRows, byCityRows, topRows, trendRows] = await Promise.all([
     db.execute(sql`
       select
@@ -246,4 +267,7 @@ export async function getBranchAnalysis(branchId: number): Promise<BranchAnalysi
     topColleges: topRows as unknown as BranchAnalysis["topColleges"],
     trend: trendRows as unknown as BranchAnalysis["trend"],
   };
-}
+  },
+  ["branch-analysis"],
+  { revalidate: REVALIDATE },
+);

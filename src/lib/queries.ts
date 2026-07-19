@@ -15,9 +15,15 @@ import {
 
 const FEE_YEAR = 2025; // must match FEE_YEAR in app/actions/admin-meta.ts
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
+import { unstable_cache } from "next/cache";
 import type { CutoffRow } from "./predictor";
 import type { SeatType } from "./reference";
 import { s3Enabled, isS3Key, signedGetUrl } from "./s3";
+
+// Predictor reference data (categories, universities, offering labels, cities)
+// changes only on ingestion — cache it. Note: unstable_cache serializes to JSON,
+// so anything cached must be a plain array/object (never a Map).
+const PREDICTOR_REVALIDATE = 3600; // 1 hour
 
 /** All colleges with their home-university name, for the directory. */
 export async function listColleges() {
@@ -308,18 +314,22 @@ export async function getCollegeCutoffMatrix(collegeId: number) {
 }
 
 /** Distinct cities (with college counts) for the predictor location filter. */
-export async function getPredictorCities() {
-  const rows = await db
-    .select({
-      city: colleges.city,
-      n: sql<number>`count(*)::int`,
-    })
-    .from(colleges)
-    .where(isNotNull(colleges.city))
-    .groupBy(colleges.city)
-    .orderBy(sql`count(*) desc`, colleges.city);
-  return rows.filter((r) => r.city);
-}
+export const getPredictorCities = unstable_cache(
+  async () => {
+    const rows = await db
+      .select({
+        city: colleges.city,
+        n: sql<number>`count(*)::int`,
+      })
+      .from(colleges)
+      .where(isNotNull(colleges.city))
+      .groupBy(colleges.city)
+      .orderBy(sql`count(*) desc`, colleges.city);
+    return rows.filter((r) => r.city);
+  },
+  ["predictor-cities"],
+  { revalidate: PREDICTOR_REVALIDATE },
+);
 
 /**
  * All verified cutoff rows across years, grouped by offering, in the shape the
@@ -363,23 +373,38 @@ export async function loadCutoffHistory(): Promise<
   return byOffering;
 }
 
+/**
+ * Cached raw arrays for the predictor form. Kept separate from getPredictorMeta
+ * because unstable_cache can only store serializable values — the Map is built
+ * from these arrays per-request (cheap) in getPredictorMeta below.
+ */
+const getPredictorMetaRaw = unstable_cache(
+  async () => {
+    const [cats, univs, cbs] = await Promise.all([
+      db.select().from(categories),
+      db.select().from(universities).orderBy(universities.name),
+      db
+        .select({
+          collegeBranchId: collegeBranches.id,
+          collegeName: colleges.name,
+          collegeSlug: colleges.slug,
+          city: colleges.city,
+          branchName: branches.name,
+        })
+        .from(collegeBranches)
+        .innerJoin(colleges, eq(collegeBranches.collegeId, colleges.id))
+        .innerJoin(branches, eq(collegeBranches.branchId, branches.id)),
+    ]);
+    return { categories: cats, universities: univs, offerings: cbs };
+  },
+  ["predictor-meta"],
+  { revalidate: PREDICTOR_REVALIDATE },
+);
+
 /** Lightweight lookups for predictor form + result rendering. */
 export async function getPredictorMeta() {
-  const [cats, univs, cbs] = await Promise.all([
-    db.select().from(categories),
-    db.select().from(universities).orderBy(universities.name),
-    db
-      .select({
-        collegeBranchId: collegeBranches.id,
-        collegeName: colleges.name,
-        collegeSlug: colleges.slug,
-        city: colleges.city,
-        branchName: branches.name,
-      })
-      .from(collegeBranches)
-      .innerJoin(colleges, eq(collegeBranches.collegeId, colleges.id))
-      .innerJoin(branches, eq(collegeBranches.branchId, branches.id)),
-  ]);
-  const offeringInfo = new Map(cbs.map((c) => [c.collegeBranchId, c]));
+  const { categories: cats, universities: univs, offerings } =
+    await getPredictorMetaRaw();
+  const offeringInfo = new Map(offerings.map((c) => [c.collegeBranchId, c]));
   return { categories: cats, universities: univs, offeringInfo };
 }
