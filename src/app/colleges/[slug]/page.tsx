@@ -12,6 +12,7 @@ import {
 } from "@/lib/queries";
 import { FileText, Globe } from "lucide-react";
 import { CutoffMatrix } from "@/components/CutoffMatrix";
+import { SeatAllocation } from "@/components/SeatAllocation";
 import { NaacSection } from "@/components/ContributePanel";
 import { AlumniShowcase } from "@/components/AlumniShowcase";
 import { AiInsights } from "@/components/AiInsights";
@@ -214,56 +215,21 @@ export default async function CollegePage({
       {offerings.some((o) => o.totalIntake != null) && (
         <section className="mt-10">
           <h2 className="text-lg font-semibold">Branch-wise seat allocation</h2>
-          <p className="mb-3 mt-1 text-sm text-muted-foreground">
-            Sanctioned intake per branch (2025 CAP) with the Maharashtra State /
-            All-India / Minority split.
-          </p>
-          <div className="overflow-x-auto rounded-xl border">
-            <table className="w-full border-collapse text-sm">
-              <thead>
-                <tr className="bg-muted/50 text-left">
-                  <th className="px-4 py-2.5 font-medium">Branch</th>
-                  <th className="px-4 py-2.5 text-right font-medium">Total seats</th>
-                  <th className="px-4 py-2.5 text-right font-medium">MH State</th>
-                  <th className="px-4 py-2.5 text-right font-medium">All India</th>
-                  <th className="px-4 py-2.5 text-right font-medium">Minority</th>
-                  {hasBranchFees && (
-                    <th className="px-4 py-2.5 text-right font-medium">Fee/yr</th>
-                  )}
-                </tr>
-              </thead>
-              <tbody>
-                {offerings.map((o) => (
-                  <tr key={o.collegeBranchId} className="border-t">
-                    <td className="px-4 py-2">{o.branchName}</td>
-                    <td className="px-4 py-2 text-right font-medium tabular-nums">
-                      {o.totalIntake ?? "—"}
-                    </td>
-                    <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                      {o.msSeats ?? "—"}
-                    </td>
-                    <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                      {o.aiSeats ?? "—"}
-                    </td>
-                    <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                      {o.minoritySeats ?? "—"}
-                    </td>
-                    {hasBranchFees && (
-                      <td className="px-4 py-2 text-right tabular-nums">
-                        {o.fee != null ? inr(o.fee) : "—"}
-                      </td>
-                    )}
-                  </tr>
-                ))}
-                <tr className="border-t bg-muted/30 font-semibold">
-                  <td className="px-4 py-2">Total</td>
-                  <td className="px-4 py-2 text-right tabular-nums">
-                    {overview.totalSeats.toLocaleString()}
-                  </td>
-                  <td colSpan={hasBranchFees ? 4 : 3} />
-                </tr>
-              </tbody>
-            </table>
+          <div className="mt-1">
+            <SeatAllocation
+              offerings={offerings.map((o) => ({
+                collegeBranchId: o.collegeBranchId,
+                branchName: o.branchName,
+                totalIntake: o.totalIntake,
+                msSeats: o.msSeats,
+                aiSeats: o.aiSeats,
+                minoritySeats: o.minoritySeats,
+                fee: o.fee,
+              }))}
+              totalSeats={overview.totalSeats}
+              hasBranchFees={hasBranchFees}
+              collegeName={college.name}
+            />
           </div>
         </section>
       )}
@@ -276,7 +242,7 @@ export default async function CollegePage({
             Closing percentile for every category (rows) across branches
             (columns). Switch seat type and filter branches.
           </p>
-          <CutoffMatrix year={matrix.year} rows={matrix.rows} />
+          <CutoffMatrix year={matrix.year} rows={matrix.rows} collegeName={college.name} />
         </section>
       )}
 

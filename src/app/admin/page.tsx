@@ -5,6 +5,7 @@ import {
   getUnclassifiedBranches,
   getPendingContributions,
   getPendingCutoffBatches,
+  getDataCoverage,
 } from "@/lib/admin";
 import { getCollegesLite } from "@/lib/compare";
 import { s3Enabled } from "@/lib/s3";
@@ -16,6 +17,8 @@ import { ModerationQueue } from "@/components/ModerationQueue";
 import { AdminUpload } from "@/components/AdminUpload";
 import { AdminData } from "@/components/AdminData";
 import { AdminMeta } from "@/components/AdminMeta";
+import { DataCoverage } from "@/components/DataCoverage";
+import { AdminResearch } from "@/components/AdminResearch";
 
 export const metadata = { title: "Admin · Data Quality" };
 export const dynamic = "force-dynamic";
@@ -57,6 +60,7 @@ export default async function AdminPage() {
     pending,
     collegesLite,
     cutoffBatches,
+    dataCoverage,
   ] = await Promise.all([
     getPipelineStats(),
     getCoverage(),
@@ -65,6 +69,7 @@ export default async function AdminPage() {
     getPendingContributions(),
     getCollegesLite(),
     getPendingCutoffBatches(),
+    getDataCoverage(),
   ]);
 
   const pct = (n: number, d: number) =>
@@ -104,6 +109,27 @@ export default async function AdminPage() {
           naac={pending.naac}
         />
       </section>
+
+      <section className="mt-10">
+        <h2 className="text-lg font-semibold">Data coverage</h2>
+        <p className="mb-3 mt-1 text-xs text-muted-foreground">
+          What each college has vs. still needs. Click a data type to filter to
+          the colleges <strong>missing</strong> it — your worklist for ingestion.
+        </p>
+        <DataCoverage rows={dataCoverage.rows} summary={dataCoverage.summary} />
+      </section>
+
+      {aiEnabled && (
+        <section className="mt-10">
+          <h2 className="text-lg font-semibold">AI research — fill missing data</h2>
+          <p className="mb-3 mt-1 text-xs text-muted-foreground">
+            Pick a college and let Gemini search the web to draft its placements,
+            NIRF and NAAC. Review, edit and save each section — nothing publishes
+            until you save it.
+          </p>
+          <AdminResearch colleges={collegesLite} />
+        </section>
+      )}
 
       <section className="mt-10">
         <h2 className="text-lg font-semibold">Upload &amp; ingest PDFs</h2>

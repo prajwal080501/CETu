@@ -69,7 +69,11 @@ function scoreOne(doc: Searchable, terms: string[]): number {
     if (nameAcr === t) best = Math.max(best, 550);
     if (nameWords.some((w) => w.startsWith(t))) best = Math.max(best, 350);
     if (t.length >= 2 && nameAcr.startsWith(t)) best = Math.max(best, 320);
-    // Buried-acronym match (mmcoe inside mmmcoekp) — the key general-case fix.
+    // Contiguous buried acronym: initials of consecutive words, e.g. "dj" for
+    // **D**warkadas **J**. Sanghvi (acronym "svpkmsdjscoevpm" contains "dj"), or
+    // "mmcoe" inside a trust-prefixed acronym. Precise, so ranked above subseq.
+    if (t.length >= 2 && nameAcr.includes(t)) best = Math.max(best, 300);
+    // Buried-acronym match via subsequence (mmcoe inside mmmcoekp), length ≥ 3.
     if (t.length >= 3 && subseq(nameAcr, t)) best = Math.max(best, 250);
     // Collapsed-name substring: initials+word merges like "kkwagh" (K K Wagh).
     if (t.length >= 3 && nameCollapsed.includes(t)) best = Math.max(best, 260);

@@ -1,8 +1,9 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ChevronDown, SlidersHorizontal } from "lucide-react";
+import { ChevronDown, SlidersHorizontal, ImageDown } from "lucide-react";
 import { SEAT_TYPE_LABELS, type SeatType } from "@/lib/reference";
+import { ShareImageModal } from "@/components/ShareImageModal";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -33,7 +34,16 @@ const CAT_ORDER = [
   "GNT1", "GNT2", "GNT3", "GOBC", "LOBC", "GSEBC", "LSEBC", "ORPHAN", "MI",
 ];
 
-export function CutoffMatrix({ year, rows }: { year: number; rows: MatrixRow[] }) {
+export function CutoffMatrix({
+  year,
+  rows,
+  collegeName,
+}: {
+  year: number;
+  rows: MatrixRow[];
+  collegeName?: string;
+}) {
+  const [share, setShare] = useState(false);
   const seatTypes = useMemo(
     () =>
       SEAT_ORDER.filter((s) => rows.some((r) => r.seatType === s)),
@@ -92,9 +102,67 @@ export function CutoffMatrix({ year, rows }: { year: number; rows: MatrixRow[] }
   };
   const fmt = (v: number) =>
     metric === "percentile" ? v.toFixed(2) : v.toLocaleString();
+  // Explicit indigo tint for the fixed-light share export (no CSS vars).
+  const tintLight = (v: number) => {
+    let t = hi === lo ? 0.5 : (v - lo) / (hi - lo);
+    if (metric === "rank") t = 1 - t;
+    return `rgba(79,70,229,${(0.06 + t * 0.34).toFixed(3)})`;
+  };
 
   return (
     <div>
+      {share && (
+        <ShareImageModal
+          title="Cutoff matrix"
+          subtitle={`${collegeName ? collegeName + " · " : ""}Closing ${
+            metric === "rank" ? "merit rank" : "percentile"
+          } · ${SEAT_TYPE_LABELS[seat as SeatType]} · ${year}`}
+          filename={`cetu-cutoffs-${year}`}
+          onClose={() => setShare(false)}
+        >
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ borderCollapse: "collapse", fontSize: "11px", width: "100%" }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: "left", padding: "6px 8px", background: "#eef2ff", fontWeight: 600 }}>
+                    Category
+                  </th>
+                  {branches.map((b) => (
+                    <th key={b} style={{ padding: "6px 6px", background: "#eef2ff", minWidth: 62, textAlign: "center", fontWeight: 600 }}>
+                      {b}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {categories.map(([code]) => (
+                  <tr key={code}>
+                    <th style={{ textAlign: "left", padding: "5px 8px", fontWeight: 700, background: "#ffffff" }}>
+                      {code}
+                    </th>
+                    {branches.map((b) => {
+                      const v = lookup.get(`${code}|${b}`);
+                      return (
+                        <td
+                          key={b}
+                          style={{
+                            padding: "5px 6px",
+                            textAlign: "center",
+                            background: v != null ? tintLight(v) : undefined,
+                            fontVariantNumeric: "tabular-nums",
+                          }}
+                        >
+                          {v != null ? fmt(v) : "—"}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </ShareImageModal>
+      )}
       <div className="mb-3 flex flex-wrap items-center gap-2">
         {/* seat-type tabs */}
         <div className="inline-flex rounded-lg border bg-muted/40 p-0.5">
@@ -163,7 +231,15 @@ export function CutoffMatrix({ year, rows }: { year: number; rows: MatrixRow[] }
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <span className="ml-auto text-xs text-muted-foreground">
+        <button
+          onClick={() => setShare(true)}
+          className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-md border bg-background px-3 text-xs font-medium shadow-xs transition-colors hover:bg-accent"
+          title="Share this matrix as a branded image"
+        >
+          <ImageDown className="h-3.5 w-3.5" />
+          Share
+        </button>
+        <span className="w-full text-right text-xs text-muted-foreground sm:w-auto">
           Closing {metric === "rank" ? "merit rank" : "percentile"} ·{" "}
           {SEAT_TYPE_LABELS[seat as SeatType]} · {year}
         </span>

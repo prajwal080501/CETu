@@ -18,7 +18,7 @@ export function QuickPredict() {
     const p = new URLSearchParams();
     if (pct) p.set("percentile", pct);
     p.set("category", "GOPEN");
-    router.push(`/predictor?${p.toString()}`);
+    router.push(`/make-my-list?${p.toString()}`);
   };
   return (
     <div className="rounded-2xl border border-primary/20 bg-gradient-to-br from-primary/[0.06] to-transparent p-5">

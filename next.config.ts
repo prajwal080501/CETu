@@ -7,11 +7,19 @@ const nextConfig: NextConfig = {
     serverActions: {
       bodySizeLimit: "25mb",
     },
-    // Optimize dynamic imports
-    optimizePackageImports: ["lucide-react", "@/components/ui"],
+    // Tree-shake heavy barrel imports so only used icons/chart parts ship.
+    optimizePackageImports: ["lucide-react", "recharts", "@base-ui/react"],
   },
-  // Top-level React Compiler config (not under experimental for v16.2)
-  reactCompiler: false, // Disable for now - requires babel-plugin-react-compiler
+  // Auto-memoize components/hooks at build time (React 19 + Next 16) — removes
+  // most manual memo/useMemo/useCallback and cuts client re-renders.
+  reactCompiler: true,
+  // Drop console.* (keep error/warn) from production client bundles.
+  compiler: {
+    removeConsole:
+      process.env.NODE_ENV === "production"
+        ? { exclude: ["error", "warn"] }
+        : false,
+  },
   // Optimize images with Next.js Image Optimization
   images: {
     unoptimized: false,

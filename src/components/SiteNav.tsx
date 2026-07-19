@@ -12,7 +12,7 @@ const LINKS: { href: string; label: string; dot?: boolean }[] = [
   { href: "/branches", label: "Branches" },
   { href: "/spot", label: "SPOT", dot: true },
   { href: "/compare", label: "Compare" },
-  { href: "/predictor", label: "Predictor" },
+  { href: "/make-my-list", label: "Make My List" },
   { href: "/discuss", label: "Discuss" },
 ];
 

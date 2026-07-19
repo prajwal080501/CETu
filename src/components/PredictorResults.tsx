@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { SEAT_TYPE_LABELS, type SeatType } from "@/lib/reference";
 import type { Chance } from "@/lib/predictor";
+import { ShareList } from "./ShareList";
 
 export interface FlatResult {
   collegeBranchId: number;
@@ -32,8 +33,8 @@ const CHANCE_STYLE: Record<Chance, string> = {
 };
 const CHANCE_LABEL: Record<Chance, string> = {
   safe: "Safe",
-  moderate: "Moderate",
-  reach: "Reach",
+  moderate: "Target",
+  reach: "Dream",
 };
 
 const RING_COLOR: Record<Chance, string> = {
@@ -91,11 +92,15 @@ function ProbabilityRing({ value, chance }: { value: number; chance: Chance }) {
 export function PredictorResults({
   results,
   year,
+  percentile,
+  category,
   initialList,
   onPersist,
 }: {
   results: FlatResult[];
   year: number;
+  percentile?: number;
+  category?: string;
   /** Server-loaded list for signed-in users; undefined = anonymous. */
   initialList?: FlatResult[];
   /** Server action to persist the list (present only when signed in). */
@@ -157,7 +162,7 @@ export function PredictorResults({
     <div className="mt-8 grid gap-8 lg:grid-cols-[1fr_20rem]">
       {/* results */}
       <div>
-        {(["safe", "moderate", "reach"] as Chance[]).map((chance) => (
+        {(["reach", "moderate", "safe"] as Chance[]).map((chance) => (
           <section key={chance} className="mb-8">
             <h2 className="mb-3 flex items-center gap-2 text-lg font-semibold">
               <span
@@ -220,6 +225,8 @@ export function PredictorResults({
       <PreferencePanel
         list={list}
         year={year}
+        percentile={percentile}
+        category={category}
         onRemove={remove}
         onMove={move}
         onClear={clear}
@@ -231,17 +238,22 @@ export function PredictorResults({
 function PreferencePanel({
   list,
   year,
+  percentile,
+  category,
   onRemove,
   onMove,
   onClear,
 }: {
   list: FlatResult[];
   year: number;
+  percentile?: number;
+  category?: string;
   onRemove: (id: number) => void;
   onMove: (id: number, dir: -1 | 1) => void;
   onClear: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [share, setShare] = useState(false);
 
   const safeCount = list.filter((r) => r.chance === "safe").length;
   const reachOnly = list.length > 0 && safeCount === 0;
@@ -270,9 +282,17 @@ function PreferencePanel({
 
   return (
     <aside className="lg:sticky lg:top-6 lg:self-start">
+      {share && (
+        <ShareList
+          list={list}
+          percentile={percentile}
+          category={category}
+          onClose={() => setShare(false)}
+        />
+      )}
       <div className="rounded-xl border border-border p-4">
         <div className="flex items-center justify-between">
-          <h3 className="font-semibold">My preference list</h3>
+          <h3 className="font-semibold">My college list</h3>
           <span className="text-xs text-muted-foreground">
             {list.length} choice{list.length === 1 ? "" : "s"}
           </span>
@@ -339,16 +359,16 @@ function PreferencePanel({
 
             <div className="mt-3 flex flex-wrap gap-2">
               <button
-                onClick={copy}
+                onClick={() => setShare(true)}
                 className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
               >
-                {copied ? "Copied!" : "Copy list"}
+                Share / Download
               </button>
               <button
-                onClick={() => window.print()}
+                onClick={copy}
                 className="rounded-md border border-input px-3 py-1.5 text-xs font-medium hover:bg-accent"
               >
-                Print
+                {copied ? "Copied!" : "Copy text"}
               </button>
               <button
                 onClick={onClear}

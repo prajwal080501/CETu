@@ -162,6 +162,71 @@ export async function getUnclassifiedBranches() {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+export interface CollegeCoverage {
+  id: number;
+  name: string;
+  city: string | null;
+  cutoffs: boolean;
+  placements: boolean;
+  nirf: boolean;
+  naac: boolean;
+  fees: boolean;
+  alumni: boolean;
+  university: boolean;
+}
+
+/**
+ * Per-college data availability matrix for the admin console: which colleges
+ * have cutoffs / placements / NIRF / NAAC / fees / alumni / home-university, and
+ * which are missing each. Powers the "what still needs data" view.
+ */
+export async function getDataCoverage(): Promise<{
+  rows: CollegeCoverage[];
+  summary: Record<string, number> & { total: number };
+}> {
+  const [cols, cutoffCollegeIds] = await Promise.all([
+    collections.colleges().find(
+      { hidden: false },
+      {
+        projection: {
+          name: 1, city: 1, homeUniversityId: 1, naacGrade: 1,
+          placements: 1, nirfRankings: 1, fees: 1, alumni: 1,
+        },
+      }
+    ).toArray(),
+    collections.cutoffs().distinct("collegeId", { verifiedAt: { $ne: null } }),
+  ]);
+  const hasCutoff = new Set(cutoffCollegeIds as number[]);
+
+  const rows: CollegeCoverage[] = cols
+    .map((c) => ({
+      id: c._id,
+      name: c.name,
+      city: c.city,
+      cutoffs: hasCutoff.has(c._id),
+      placements: (c.placements ?? []).some((p) => p.verifiedAt != null),
+      nirf: (c.nirfRankings ?? []).length > 0,
+      naac: !!c.naacGrade,
+      fees: (c.fees ?? []).length > 0,
+      alumni: (c.alumni ?? []).some((a) => a.verifiedAt != null),
+      university: c.homeUniversityId != null,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const count = (k: keyof CollegeCoverage) => rows.filter((r) => r[k] === true).length;
+  const summary = {
+    total: rows.length,
+    cutoffs: count("cutoffs"),
+    placements: count("placements"),
+    nirf: count("nirf"),
+    naac: count("naac"),
+    fees: count("fees"),
+    alumni: count("alumni"),
+    university: count("university"),
+  };
+  return { rows, summary };
+}
+
 /** Coverage: colleges with a home university and with a city. */
 export async function getCoverage() {
   const [withUniversity, withCity, total] = await Promise.all([

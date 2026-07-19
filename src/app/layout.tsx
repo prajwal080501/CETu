@@ -21,16 +21,49 @@ const geistMono = Geist_Mono({
   display: "swap",
 });
 
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? "https://cetu.vercel.app";
+const SITE_DESCRIPTION =
+  "Search Maharashtra engineering colleges, explore branches, and check MHT-CET CAP cutoffs by category and seat type (Home University / Other Than Home University / State Level) — plus a percentile-based college predictor, side-by-side compare, seats, fees, NIRF/NAAC and placements.";
+
 export const metadata: Metadata = {
+  metadataBase: new URL(SITE_URL),
   title: {
     default: "CETu — MHT-CET Engineering College Research Hub",
     template: "%s · CETu",
   },
-  description:
-    "Search Maharashtra engineering colleges, explore branches, and check MHT-CET CAP cutoffs by category and seat type (Home University / Other Than Home University / State Level) — all in one place.",
-  generator: "Next.js",
+  description: SITE_DESCRIPTION,
   applicationName: "CETu",
+  generator: "Next.js",
   referrer: "strict-origin-when-cross-origin",
+  keywords: [
+    "MHT-CET", "MHT CET cutoff", "Maharashtra engineering colleges",
+    "CAP cutoff", "MHT-CET college predictor", "MHT-CET percentile predictor",
+    "engineering admission Maharashtra", "COEP", "VJTI", "PICT", "DJ Sanghvi",
+    "home university seat type", "college compare", "engineering branches",
+  ],
+  authors: [{ name: "CETu" }],
+  creator: "CETu",
+  publisher: "CETu",
+  category: "education",
+  alternates: { canonical: "/" },
+  openGraph: {
+    type: "website",
+    siteName: "CETu",
+    title: "CETu — MHT-CET Engineering College Research Hub",
+    description: SITE_DESCRIPTION,
+    url: SITE_URL,
+    locale: "en_IN",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "CETu — MHT-CET Engineering College Research Hub",
+    description: SITE_DESCRIPTION,
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: { index: true, follow: true, "max-image-preview": "large" },
+  },
 };
 
 export const viewport: Viewport = {
