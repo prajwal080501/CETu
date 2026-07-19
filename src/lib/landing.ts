@@ -45,28 +45,44 @@ export const getRankedColleges = unstable_cache(
     ? sql`and c.city ilike ${opts.area}`
     : sql``;
   const limitClause = opts?.limit ? sql`limit ${opts.limit}` : sql``;
+  // Single-pass ranking: compute each college's seats/branch-count and its best
+  // GOPEN closing percentile (+ the branch that owns it) in two grouped scans,
+  // then join onto colleges. This replaces four correlated subqueries per row
+  // (which forced the 65k-row cutoffs table to be re-scanned per college) with
+  // one aggregate over each source table.
   const rows = await db.execute(sql`
+    with seat_agg as (
+      select cb.college_id,
+             coalesce(sum(cb.total_intake), 0)::int as total_seats,
+             count(*)::int as branch_count
+      from college_branches cb
+      group by cb.college_id
+    ),
+    cut_agg as (
+      select cb.college_id,
+             max(cu.closing_percentile)::float as top_cutoff,
+             (array_agg(b.name order by cu.closing_percentile desc))[1] as top_branch
+      from college_branches cb
+      join cutoffs cu on cu.college_branch_id = cb.id
+      join categories cat on cat.id = cu.category_id
+      join branches b on b.id = cb.branch_id
+      where cu.year = ${PREDICT_YEAR}
+        and cat.code = 'GOPEN'
+        and cu.verified_at is not null
+      group by cb.college_id
+    )
     select
       c.id, c.name, c.slug, c.city, c.type, c.is_autonomous as "isAutonomous",
       c.aicte_approved as "aicteApproved", c.naac_grade as "naacGrade",
       c.website, u.name as university,
-      coalesce((select sum(cb.total_intake) from college_branches cb
-                where cb.college_id = c.id), 0)::int as "totalSeats",
-      (select count(*) from college_branches cb where cb.college_id = c.id)::int as "branchCount",
-      (select max(cu.closing_percentile) from college_branches cb
-         join cutoffs cu on cu.college_branch_id = cb.id
-         join categories cat on cat.id = cu.category_id
-        where cb.college_id = c.id and cu.year = ${PREDICT_YEAR}
-          and cat.code = 'GOPEN' and cu.verified_at is not null)::float as "topCutoff",
-      (select b.name from college_branches cb
-         join cutoffs cu on cu.college_branch_id = cb.id
-         join categories cat on cat.id = cu.category_id
-         join branches b on b.id = cb.branch_id
-        where cb.college_id = c.id and cu.year = ${PREDICT_YEAR}
-          and cat.code = 'GOPEN' and cu.verified_at is not null
-        order by cu.closing_percentile desc limit 1) as "topBranch"
+      coalesce(sa.total_seats, 0) as "totalSeats",
+      coalesce(sa.branch_count, 0) as "branchCount",
+      ca.top_cutoff as "topCutoff",
+      ca.top_branch as "topBranch"
     from colleges c
     left join universities u on u.id = c.home_university_id
+    left join seat_agg sa on sa.college_id = c.id
+    left join cut_agg ca on ca.college_id = c.id
     where c.hidden = false ${areaClause}
     order by "topCutoff" desc nulls last, "totalSeats" desc
     ${limitClause}
@@ -92,17 +108,21 @@ export interface SearchDoc {
 export const getSearchIndex = unstable_cache(
   async (): Promise<SearchDoc[]> => {
   const rows = await db.execute(sql`
+    with cut_agg as (
+      select cb.college_id, max(cu.closing_percentile) as top_cutoff
+      from college_branches cb
+      join cutoffs cu on cu.college_branch_id = cb.id
+      join categories cat on cat.id = cu.category_id
+      where cu.year = ${PREDICT_YEAR}
+        and cat.code = 'GOPEN' and cu.verified_at is not null
+      group by cb.college_id
+    )
     select c.name, c.slug, c.city, u.name as university
     from colleges c
     left join universities u on u.id = c.home_university_id
+    left join cut_agg ca on ca.college_id = c.id
     where c.hidden = false
-    order by
-      (select max(cu.closing_percentile) from college_branches cb
-         join cutoffs cu on cu.college_branch_id = cb.id
-         join categories cat on cat.id = cu.category_id
-        where cb.college_id = c.id and cu.year = ${PREDICT_YEAR}
-          and cat.code = 'GOPEN' and cu.verified_at is not null) desc nulls last,
-      c.name
+    order by ca.top_cutoff desc nulls last, c.name
   `);
   return rows as unknown as SearchDoc[];
   },
