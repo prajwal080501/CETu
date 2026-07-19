@@ -161,7 +161,15 @@ export async function commitPlacements(collegeId: number, records: PlacementReco
   await requireAdminSession();
   if (!collegeId || !records?.length) return { ok: false, error: "Nothing to save." };
   const now = new Date();
-  const clean = records.filter((r) => r.year);
+  // Skip empty rows — a placement needs at least one real figure, or it just
+  // creates noise (and can skew the "top placements" widget).
+  const clean = records.filter(
+    (r) =>
+      r.year &&
+      (r.avgLpa != null || r.medianLpa != null || r.highestLpa != null || r.ratePct != null)
+  );
+  if (clean.length === 0)
+    return { ok: false, error: "No placement rows had any figures to save." };
   const ids = await nextIds("placements", clean.length);
   const docs = clean.map((r, i) => ({
     id: ids[i],

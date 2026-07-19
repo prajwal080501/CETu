@@ -82,7 +82,7 @@ const PLACEMENTS: PlaceRow[] = [
   { dte: "06006", year: 2024, avg: 11.62, highest: 52.57, rate: 84, recruiters: "Nutanix, FINIQ, Oracle, Future First", source: "https://www.coeptech.ac.in/wp-content/uploads/2025/08/Placement-Statistics-2024-25.pdf" }, // AY 2024-25, official PDF
   { dte: "06271", year: 2024, median: 8.38, rate: 92.89, recruiters: "Accenture, Barclays, HCL, L&T Infotech", source: "https://www.pict.edu/placement/" },
   { dte: "06273", year: 2024, median: 7.6, highest: 50.0, recruiters: "Accenture, Cognizant, Infosys", source: "https://www.vit.edu/placement/" },
-  { dte: "06177", year: 2024, avg: 5.0, highest: 55.0, rate: 51, recruiters: "HCL, TATA, Infosys, IBM, ICICI Bank", source: "https://cms.sinhgad.edu/sinhgad_engineering_institutes/vadgaon_scoe/scoe_placements.aspx", reported: true },
+  { dte: "06177", year: 2024, avg: 5.0, rate: 51, recruiters: "HCL, TATA, Infosys, IBM, ICICI Bank", source: "https://cms.sinhgad.edu/sinhgad_engineering_institutes/vadgaon_scoe/scoe_placements.aspx", reported: true }, // highest package removed — 55 LPA was an unverifiable self-reported outlier
   { dte: "06272", year: 2024, median: 6.0, highest: 52.0, rate: 73, source: "http://www.dypcoeakurdi.ac.in/placements/placement-statistics" },
   { dte: "06145", year: 2024, avg: 5.5, highest: 26.4, recruiters: "TCS, Tech Mahindra, Accenture, IBM", source: "https://jspmjscoe.edu.in/placements/statistics", reported: true },
   // Nagpur

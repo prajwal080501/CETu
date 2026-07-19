@@ -117,7 +117,12 @@ Respond with ONLY a JSON object (no prose) of this exact shape:
           ratePct: num(p.ratePct),
           recruiters: str(p.recruiters),
         }))
-        .filter((p) => p.year > 0)
+        // Drop rows with a year but no actual figures — they carry no info.
+        .filter(
+          (p) =>
+            p.year > 0 &&
+            (p.avgLpa != null || p.medianLpa != null || p.highestLpa != null || p.ratePct != null)
+        )
     : [];
 
   const nirf: NirfRecord[] = Array.isArray(json.nirf)
