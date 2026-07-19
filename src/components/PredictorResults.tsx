@@ -154,12 +154,16 @@ export function PredictorResults({
     });
   const clear = () => setList([]);
 
-  // Within each bucket, show the "top" (highest admission probability) first.
-  const byProb = (a: FlatResult, b: FlatResult) => b.probability - a.probability;
+  // Within each bucket, show the BEST college first — highest closing percentile
+  // = the strongest option you can still get. Sorting by probability instead
+  // would tie all "Safe" colleges at ~99% and float low-cutoff safety-nets
+  // (e.g. closing 57) to the top for a high-percentile student.
+  const byClosing = (a: FlatResult, b: FlatResult) =>
+    b.closingPercentile - a.closingPercentile;
   const buckets: Record<Chance, FlatResult[]> = {
-    safe: results.filter((r) => r.chance === "safe").sort(byProb),
-    moderate: results.filter((r) => r.chance === "moderate").sort(byProb),
-    reach: results.filter((r) => r.chance === "reach").sort(byProb),
+    safe: results.filter((r) => r.chance === "safe").sort(byClosing),
+    moderate: results.filter((r) => r.chance === "moderate").sort(byClosing),
+    reach: results.filter((r) => r.chance === "reach").sort(byClosing),
   };
 
   const [visibleChances, setVisibleChances] = useState<Set<Chance>>(
