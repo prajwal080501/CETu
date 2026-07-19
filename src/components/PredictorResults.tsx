@@ -174,9 +174,9 @@ export function PredictorResults({
     });
 
   return (
-    <div className="mt-8 grid gap-8 lg:grid-cols-[1fr_20rem]">
+    <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1fr)_20rem]">
       {/* results */}
-      <div>
+      <div className="min-w-0">
         {/* Dream / Target / Safe filters */}
         <div className="mb-5 flex flex-wrap items-center gap-2">
           <span className="text-xs font-medium text-muted-foreground">Show</span>
@@ -226,7 +226,7 @@ export function PredictorResults({
                       <div className="min-w-0">
                         <a
                           href={`/colleges/${r.collegeSlug}`}
-                          className="font-medium hover:text-primary"
+                          className="block break-words font-medium hover:text-primary"
                         >
                           {r.collegeName}
                         </a>

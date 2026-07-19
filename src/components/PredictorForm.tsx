@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Sparkles } from "lucide-react";
+import { Sparkles, Loader2 } from "lucide-react";
 import {
   Select,
   SelectContent,
@@ -42,6 +42,7 @@ export function PredictorForm({
   };
 }) {
   const router = useRouter();
+  const [pending, startTransition] = useTransition();
   const [percentile, setPercentile] = useState(defaults.percentile ?? "");
   const [category, setCategory] = useState(defaults.category ?? "GOPEN");
   const [university, setUniversity] = useState(defaults.university ?? NONE);
@@ -54,7 +55,7 @@ export function PredictorForm({
     p.set("category", category);
     if (university && university !== NONE) p.set("university", university);
     if (city && city !== NONE) p.set("city", city);
-    router.push(`/predictor?${p.toString()}`);
+    startTransition(() => router.push(`/make-my-list?${p.toString()}`));
   };
 
   return (
@@ -138,9 +139,13 @@ export function PredictorForm({
             </Select>
           </div>
 
-          <Button type="submit" size="lg" className="h-10 gap-1.5">
-            <Sparkles className="h-4 w-4" />
-            Predict
+          <Button type="submit" size="lg" disabled={pending} className="h-10 gap-1.5">
+            {pending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Sparkles className="h-4 w-4" />
+            )}
+            {pending ? "Building…" : "Predict"}
           </Button>
         </form>
         <p className="mt-3 text-xs text-muted-foreground">

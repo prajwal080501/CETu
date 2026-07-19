@@ -35,7 +35,7 @@ function ResultsLoader() {
         <Loader2 className="h-4 w-4 animate-spin" />
         Building your list from {PREDICT_YEAR} CAP cutoffs…
       </div>
-      <div className="mt-6 grid gap-8 lg:grid-cols-[1fr_20rem]">
+      <div className="mt-6 grid gap-8 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <div className="space-y-6">
           {[0, 1, 2].map((s) => (
             <div key={s}>
