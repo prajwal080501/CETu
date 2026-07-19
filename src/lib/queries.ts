@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { collections } from "@/db/collections";
 import { cached } from "./query-cache";
 import type { CutoffRow } from "./predictor";
@@ -6,6 +7,23 @@ import type { SeatType } from "./reference";
 import { s3Enabled, isS3Key, signedGetUrl } from "./s3";
 
 const FEE_YEAR = 2025; // must match FEE_YEAR in app/actions/admin-meta.ts
+
+/**
+ * Per-request memoized reads of a full college document. The college detail page
+ * needs several slices of the same doc (bySlug + overview + branches-fees +
+ * placements + alumni + nirf + documents); React `cache()` collapses those into
+ * a single Mongo round-trip per (slug/id) within one render.
+ */
+const collegeBySlugDoc = cache((slug: string) =>
+  collections.colleges().findOne({ slug, hidden: false })
+);
+const collegeByIdDoc = cache((collegeId: number) =>
+  collections.colleges().findOne({ _id: collegeId })
+);
+// Small reference collections re-read by several detail-page queries — memoize
+// per request so branches/categories are fetched at most once per render.
+const allBranches = cache(() => collections.branches().find({}).toArray());
+const allCategories = cache(() => collections.categories().find({}).toArray());
 
 // Predictor reference data (categories, universities, offering labels, cities)
 // changes only on ingestion — cache it. Note: the data cache serializes to JSON,
@@ -48,7 +66,7 @@ export async function listColleges() {
 }
 
 export async function getCollegeBySlug(slug: string) {
-  const c = await collections.colleges().findOne({ slug, hidden: false });
+  const c = await collegeBySlugDoc(slug);
   if (!c) return null;
   return {
     id: c._id,
@@ -73,9 +91,7 @@ export async function getCollegeBySlug(slug: string) {
 
 /** Verified placements for a college, newest year first. */
 export async function getCollegePlacements(collegeId: number) {
-  const c = await collections
-    .colleges()
-    .findOne({ _id: collegeId }, { projection: { placements: 1 } });
+  const c = await collegeByIdDoc(collegeId);
   return (c?.placements ?? [])
     .filter((p) => p.verifiedAt != null)
     .sort((a, b) => b.year - a.year)
@@ -94,9 +110,7 @@ export async function getCollegePlacements(collegeId: number) {
  * Admin-uploaded docs store an S3 key in `url`; resolve those to a short-lived
  * presigned URL. Legacy external http(s) URLs (seeded docs) pass through. */
 export async function getCollegeDocuments(collegeId: number) {
-  const c = await collections
-    .colleges()
-    .findOne({ _id: collegeId }, { projection: { documents: 1 } });
+  const c = await collegeByIdDoc(collegeId);
   const rows = (c?.documents ?? [])
     .slice()
     .sort((a, b) => (b.year ?? 0) - (a.year ?? 0))
@@ -115,9 +129,7 @@ export async function getCollegeDocuments(collegeId: number) {
 
 /** Verified alumni for a college (with photo/company/role), newest batch first. */
 export async function getCollegeAlumni(collegeId: number) {
-  const c = await collections
-    .colleges()
-    .findOne({ _id: collegeId }, { projection: { alumni: 1 } });
+  const c = await collegeByIdDoc(collegeId);
   const rows = (c?.alumni ?? [])
     .filter((a) => a.verifiedAt != null)
     .sort(
@@ -146,9 +158,7 @@ export async function getCollegeAlumni(collegeId: number) {
 
 /** Latest NIRF Engineering ranking for a college (or null). */
 export async function getCollegeNirf(collegeId: number) {
-  const c = await collections
-    .colleges()
-    .findOne({ _id: collegeId }, { projection: { nirfRankings: 1 } });
+  const c = await collegeByIdDoc(collegeId);
   const rows = (c?.nirfRankings ?? []).slice().sort((a, b) => b.year - a.year);
   const row = rows[0];
   return row
@@ -179,10 +189,8 @@ export async function getCollegeOverview(collegeId: number) {
 export async function getCollegeBranches(collegeId: number) {
   const [offerings, branchDocs, college] = await Promise.all([
     collections.offerings().find({ collegeId }).toArray(),
-    collections.branches().find({}).toArray(),
-    collections
-      .colleges()
-      .findOne({ _id: collegeId }, { projection: { fees: 1 } }),
+    allBranches(),
+    collegeByIdDoc(collegeId),
   ]);
   const branchById = new Map(branchDocs.map((b) => [b._id, b]));
   const feeFor = new Map<number, number | null>();
@@ -227,7 +235,7 @@ export async function getCutoffsForOffering(collegeBranchId: number) {
       .cutoffs()
       .find({ collegeBranchId, verifiedAt: { $ne: null } })
       .toArray(),
-    collections.categories().find({}).toArray(),
+    allCategories(),
   ]);
   const labelByCode = new Map(cats.map((c) => [c.code, c.label]));
   return rows
@@ -291,8 +299,8 @@ export async function getCollegeCutoffMatrix(collegeId: number) {
       .cutoffs()
       .find({ collegeId, verifiedAt: { $ne: null } })
       .toArray(),
-    collections.branches().find({}).toArray(),
-    collections.categories().find({}).toArray(),
+    allBranches(),
+    allCategories(),
   ]);
   if (rows.length === 0) return { year: null as number | null, rows: [] };
 
@@ -340,7 +348,17 @@ export const getPredictorCities = cached(
  * All verified cutoff rows across years, grouped by offering, in the shape the
  * trend-aware predictor consumes. Enables projecting next year's cutoff.
  */
+// The full verified-cutoff history (~65k rows) is identical for every predictor
+// request and too large for the Next data cache (2 MB limit). Cache it in-process
+// per server instance with a short TTL so we don't re-read + re-transfer it on
+// every request; a warm instance serves subsequent predictions from memory.
+let _historyCache: { at: number; data: Map<number, CutoffHistoryRow[]> } | null = null;
+const HISTORY_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 export async function loadCutoffHistory(): Promise<Map<number, CutoffHistoryRow[]>> {
+  if (_historyCache && Date.now() - _historyCache.at < HISTORY_TTL_MS)
+    return _historyCache.data;
+
   const rows = await collections
     .cutoffs()
     .find(
@@ -370,6 +388,7 @@ export async function loadCutoffHistory(): Promise<Map<number, CutoffHistoryRow[
     if (list) list.push(row);
     else byOffering.set(r.collegeBranchId, [row]);
   }
+  _historyCache = { at: Date.now(), data: byOffering };
   return byOffering;
 }
 

@@ -62,6 +62,12 @@ async function main() {
     { key: { collegeBranchId: 1 }, name: "by_cb" },
     { key: { closingPercentile: -1 }, name: "by_percentile" },
     { key: { verifiedAt: 1 }, name: "by_verified" },
+    // Serve the college-detail matrix + compare (filter by college, verified).
+    { key: { collegeId: 1, verifiedAt: 1 }, name: "by_college" },
+    // Serve branch analysis + ranking's top-branch (filter by branch, verified).
+    { key: { branchId: 1, verifiedAt: 1 }, name: "by_branch" },
+    // Serve the GOPEN-by-year rankings/search/heatmap aggregations.
+    { key: { year: 1, categoryCode: 1, verifiedAt: 1 }, name: "by_year_cat" },
     {
       key: { collegeBranchId: 1, year: 1, round: 1, seatType: 1, categoryId: 1 },
       name: "uq",
